@@ -1,21 +1,27 @@
 import os
 from pathlib import Path
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, RedirectResponse
-from fastapi.staticfiles import StaticFiles
-
-from app.auth import router as auth_router
 from app.config import GEMINI_API_KEY, MODEL_NAME
 from app.db import init_db
 
-# Set Gemini API key before ADK initialises — it reads this at import time
+# Initialize DB at module-load time — must happen before get_fast_api_app()
+# because ADK imports agent.py → keys.py which queries the DB.
+# @app.on_event("startup") is NOT used because the ADK ASGI wrapper intercepts
+# the lifespan scope and the handler never fires.
+init_db()
+
+# Set Gemini API key before ADK initialises — it reads GOOGLE_API_KEY at import
 if GEMINI_API_KEY:
     os.environ["GOOGLE_API_KEY"] = GEMINI_API_KEY
     os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "False"
 
+from fastapi import FastAPI  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from fastapi.responses import FileResponse, RedirectResponse  # noqa: E402
+from fastapi.staticfiles import StaticFiles  # noqa: E402
 from google.adk.cli.fast_api import get_fast_api_app  # noqa: E402
+
+from app.auth import router as auth_router  # noqa: E402
 
 AGENT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 app: FastAPI = get_fast_api_app(
@@ -38,11 +44,6 @@ app.add_middleware(
 
 # Auth + wallet routes
 app.include_router(auth_router)
-
-# Initialize SQLite DB on startup
-@app.on_event("startup")
-async def startup() -> None:
-    init_db()
 
 # Serve React chat UI build if it exists
 _DIST = Path(__file__).parent.parent / "frontend" / "dist"

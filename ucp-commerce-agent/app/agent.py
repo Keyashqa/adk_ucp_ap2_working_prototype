@@ -134,13 +134,15 @@ _CINEMA_TOOLS = genai_types.Tool(function_declarations=[
         description=(
             "Call this ONLY once the user has explicitly agreed to all booking details: "
             "theater, movie, showtime slot, seat type, and number of seats. "
-            "Do NOT call this unless the user has confirmed."
+            "Do NOT call this unless the user has confirmed. "
+            "CRITICAL: movie_id MUST be the exact 'id' field from search_movies results "
+            "(e.g. 'mov-001', 'mov-002', 'mov-003'). Never invent or guess an ID."
         ),
         parameters=genai_types.Schema(
             type=genai_types.Type.OBJECT,
             properties={
                 "theater_id":  genai_types.Schema(type=genai_types.Type.STRING, description="e.g. pvr-001 or inox-001"),
-                "movie_id":    genai_types.Schema(type=genai_types.Type.STRING, description="Movie ID from search_movies"),
+                "movie_id":    genai_types.Schema(type=genai_types.Type.STRING, description="Exact 'id' from search_movies — e.g. 'mov-001'. Never make up an ID."),
                 "movie_title": genai_types.Schema(type=genai_types.Type.STRING, description="Movie title for display"),
                 "slot":        genai_types.Schema(type=genai_types.Type.STRING, description="Slot letter: A=10:00 AM, B=2:30 PM, C=7:00 PM, D=10:15 PM"),
                 "seat_code":   genai_types.Schema(type=genai_types.Type.STRING, description="S=Standard, P=Premium Recliner, I=IMAX"),
@@ -168,13 +170,18 @@ Showtime slots:  A = 10:00 AM  |  B = 2:30 PM  |  C = 7:00 PM  |  D = 10:15 PM
 Seat categories: S = Standard ($12)  |  P = Premium Recliner ($18)  |  I = IMAX ($22)
 
 Workflow:
-1. When the conversation starts, call search_movies to get the current catalog.
-2. Show the movies in a readable format and ask what the user wants to watch.
+1. The catalog has already been fetched — it is in your conversation history as a search_movies result.
+   Use those exact movie IDs. Do NOT call search_movies again unless the user asks to refresh.
+2. Show the movies and ask what the user wants to watch.
 3. If the user asks about times, call get_showtimes for that movie + theater.
 4. Guide the user to pick: theater → movie → showtime → seat type → number of seats.
 5. Summarise the selection and ask the user to confirm.
-6. Once confirmed, call confirm_booking with all required details.
+6. Once confirmed, call confirm_booking — use the EXACT movie_id from the search_movies result
+   already in your history (e.g. 'mov-001', 'mov-002'). Never invent or guess an ID.
 7. If the user wants to quit at any point, call cancel_booking.
+
+CRITICAL RULE: movie_id in confirm_booking must always be the exact 'id' field
+from the search_movies tool result (like 'mov-001'). Inventing an ID causes a hard error.
 
 Keep responses concise and conversational. Show prices when relevant.
 """
@@ -246,21 +253,92 @@ def _unpack_history(history: list[dict]) -> list[genai_types.Content]:
 async def conversation_agent(ctx: Context, node_input: Any):
     client = _get_genai_client()
 
-    # ── First invocation: fetch UCP profile, greet the user ───────────────────
+    # ── First invocation: fetch catalog + greet the user ─────────────────────
     if "chat_history" not in ctx.state:
         profile = await _CLIENT.fetch_ucp_profile()
         ctx.state["merchant_public_jwk"] = profile.get("merchant_public_jwk", {})
 
-        welcome = (
-            "🎬 Welcome to CineAgent! I can help you find and book movie tickets.\n"
-            "What would you like to watch today?"
+        # Pre-fetch the full catalog and inject it as a real search_movies tool
+        # result in history.  This guarantees the LLM always has genuine movie IDs
+        # (mov-001, mov-002, …) in context before the user types anything, so it
+        # can never invent an ID when calling confirm_booking.
+        movies_rsp = await _CLIENT.mcp_call(
+            "search_movies", {"query": "", "limit": 20, "theater_id": "pvr-001"}
         )
+        movies_data = movies_rsp.get("result", {})
+        movies = movies_data.get("movies", [])
+
+        # Build a human-readable list for the welcome message
+        movie_lines = "\n".join(
+            f"  {i+1}. {m['title']} (ID: {m['id']}) — {m['genre']}, {m['duration_min']} min"
+            for i, m in enumerate(movies)
+        )
+        welcome = (
+            "🎬 Welcome to CineAgent! Here's what's playing right now:\n\n"
+            f"{movie_lines}\n\n"
+            "Which movie would you like to watch? I can also show showtimes and prices."
+        )
+
+        # Bootstrap history: simulate the search_movies call that already happened.
+        # Gemini conversation rule: history must start with a user turn, and a
+        # model function_call must immediately follow a user turn or function_response.
+        # Pattern: user(seed) → model(function_call) → user(function_response) → model(text)
         ctx.state["chat_history"] = _pack_history([
-            genai_types.Content(role="model", parts=[genai_types.Part(text=welcome)])
+            genai_types.Content(role="user", parts=[
+                genai_types.Part(text="Hello, I'd like to book a movie ticket.")
+            ]),
+            genai_types.Content(role="model", parts=[
+                genai_types.Part(function_call=genai_types.FunctionCall(
+                    name="search_movies", args={"query": "", "theater_id": "pvr-001"}
+                ))
+            ]),
+            genai_types.Content(role="user", parts=[
+                genai_types.Part(function_response=genai_types.FunctionResponse(
+                    name="search_movies", response=movies_data
+                ))
+            ]),
+            genai_types.Content(role="model", parts=[genai_types.Part(text=welcome)]),
         ])
 
         yield Event(content=_content(welcome))
         yield RequestInput(interrupt_id="chat_turn", message=welcome)
+        return
+
+    # ── Re-invoked after validate_selection rejected the LLM's selection ────────
+    # validate_selection routes "invalid" back here with _validation_error in
+    # node_input.  We inject the error into the LLM's history so it understands
+    # what went wrong, run it once to produce a corrective reply, then re-pause.
+    if isinstance(node_input, dict) and "_validation_error" in node_input:
+        err = node_input["_validation_error"]
+        history: list[dict] = list(ctx.state.get("chat_history", []))
+        history.append({
+            "role": "user",
+            "parts": [{"text": (
+                f"[System: booking validation failed — {err}. "
+                "The movie_id or other details you passed to confirm_booking were wrong. "
+                "Check the exact IDs from the search_movies result already in your history. "
+                "Apologise briefly to the user and ask them to clarify."
+            )}],
+        })
+        response = await client.aio.models.generate_content(
+            model=MODEL_NAME,
+            contents=_unpack_history(history),
+            config=genai_types.GenerateContentConfig(
+                system_instruction=_SYSTEM_PROMPT,
+                tools=[_CINEMA_TOOLS],
+            ),
+        )
+        raw_parts = response.candidates[0].content.parts
+        text = "\n".join(p.text for p in raw_parts if getattr(p, "text", None)).strip()
+        if not text:
+            text = (
+                "Sorry, I had trouble with those booking details. "
+                "Could you confirm which movie you'd like? I'll look it up properly."
+            )
+        history.append({"role": "model", "parts": [{"text": text}]})
+        ctx.state["chat_history"] = history
+        yield Event(content=_content(text))
+        yield RequestInput(interrupt_id="chat_turn", message=text)
         return
 
     # ── Resumed: get the user's latest message ────────────────────────────────
@@ -362,7 +440,90 @@ async def conversation_agent(ctx: Context, node_input: Any):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 2 — create_checkout
+# NODE 2 — validate_selection
+#
+# Hard gate between LLM output and the merchant API.
+#
+# Problem: the LLM can call confirm_booking with an invented movie_id (e.g.
+# "dune-messiah-id" instead of "mov-002"). This node catches that before any
+# real money or merchant state is touched.
+#
+# Calls get_showtimes(theater_id, movie_id) against the live merchant.
+# If the movie doesn't exist at that theater, the MCP returns empty shows.
+# Any field mismatch → route "invalid" back to conversation_agent with the
+# exact error so the LLM can correct itself.
+# All fields verified → route "valid" forward to create_checkout.
+# ══════════════════════════════════════════════════════════════════════════════
+
+async def validate_selection(node_input: dict[str, Any]) -> Any:
+    theater_id = str(node_input.get("theater_id", "")).strip()
+    movie_id   = str(node_input.get("movie_id",   "")).strip()
+    slot       = str(node_input.get("slot",       "")).upper().strip()
+    seat_code  = str(node_input.get("seat",       "")).upper().strip()
+    qty        = int(node_input.get("qty", 0))
+
+    issues: list[str] = []
+
+    try:
+        rsp = await _CLIENT.mcp_call("get_showtimes", {
+            "theater_id": theater_id,
+            "movie_id":   movie_id,
+        })
+        data  = rsp.get("result", {})
+        shows = data.get("shows", [])     # list of {slot, time_label, …}
+        seats = data.get("seats", {})     # {code: {label, price_cents, …}}
+    except Exception as exc:
+        issues.append(f"merchant unreachable: {exc}")
+        shows = []
+        seats = {}
+
+    # 1. Movie must actually be showing at this theater
+    if not issues and not shows:
+        issues.append(
+            f"movie_id '{movie_id}' is not screening at theater '{theater_id}'. "
+            "Use the exact 'id' field (e.g. 'mov-001', 'mov-002') from the "
+            "search_movies result already in your history."
+        )
+
+    # 2. Slot must exist in the live schedule
+    valid_slots = {s["slot"] for s in shows}
+    if shows and slot not in valid_slots:
+        issues.append(
+            f"slot '{slot}' is not available. "
+            f"Valid slots: {', '.join(sorted(valid_slots))}"
+        )
+
+    # 3. Seat code must be a real category
+    if seats and seat_code not in seats:
+        issues.append(
+            f"seat_code '{seat_code}' is not valid. "
+            f"Valid codes: {', '.join(seats.keys())}"
+        )
+
+    # 4. Quantity must be sane
+    if not (1 <= qty <= 6):
+        issues.append(f"qty {qty} is out of range — must be 1 to 6")
+
+    if issues:
+        err = "; ".join(issues)
+        return Event(
+            output={**node_input, "_validation_error": err},
+            route="invalid",
+            content=_content(f"[validate_selection: INVALID — {err}]"),
+        )
+
+    return Event(
+        output=node_input,
+        route="valid",
+        content=_content(
+            f"[validate_selection: OK — {movie_id} @ {theater_id}, "
+            f"slot {slot}, {seat_code}×{qty}]"
+        ),
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NODE 3 — create_checkout
 # Automated: real HTTP MCP create_checkout → merchant-signed CartMandate returned
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -758,8 +919,13 @@ root_agent = Workflow(
         ("START", conversation_agent),
 
         (conversation_agent, {
-            "selected":  create_checkout,
+            "selected":  validate_selection,      # LLM output goes here first …
             "cancelled": booking_cancelled_terminal,
+        }),
+
+        (validate_selection, {
+            "valid":   create_checkout,           # … only reaches checkout if all fields verified
+            "invalid": conversation_agent,        # LLM must correct itself and try again
         }),
 
         (create_checkout, verify_booking),

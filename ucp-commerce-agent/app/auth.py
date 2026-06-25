@@ -118,8 +118,8 @@ async def register(req: RegisterRequest) -> dict:
         )
         wallet_id = uuid.uuid4().hex[:16]
         conn.execute(
-            "INSERT INTO wallets (id, user_id, balance_cents) VALUES (?,?,?)",
-            (wallet_id, user_id, 0),
+            "INSERT INTO wallets (id, user_id) VALUES (?,?)",
+            (wallet_id, user_id),
         )
         token = secrets.token_hex(32)
         expires_at = (datetime.now(timezone.utc) + timedelta(hours=TOKEN_TTL_HOURS)).isoformat()
@@ -253,3 +253,16 @@ async def topup_wallet(req: TopupRequest) -> dict:
         raise HTTPException(status_code=400, detail="Amount must be between 1¢ and $10,000")
     new_balance = await wallet_ops.deposit(user["id"], req.amount_cents, reason="topup")
     return {"balance_cents": new_balance}
+
+
+@router.get("/wallet/verify-chain")
+async def verify_wallet_chain(token: str) -> dict:
+    """Walk the ledger hash chain for this user and verify integrity.
+
+    Returns {"valid": true, "entries": N} if nothing was tampered with.
+    Returns {"valid": false, "error": "..."} if any row was modified.
+
+    Try it:  curl "http://localhost:8000/wallet/verify-chain?token=<your-token>"
+    """
+    user = _get_user_from_token(token)
+    return wallet_ops.verify_chain(user["id"])
