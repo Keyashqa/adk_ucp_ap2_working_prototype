@@ -16,6 +16,8 @@ dependencies = [
     "ap2",
     "ucp-sdk",
     "httpx>=0.28.0",
+    "passlib[bcrypt]>=1.7.4",
+    "python-dotenv>=1.2.2",
 ]
 requires-python = ">=3.11,<3.14"
 

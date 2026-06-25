@@ -1,0 +1,306 @@
+╔══════════════════════════════════════════════════════════════════╗
+║           UCP Cinema Booking Platform — Run Guide               ║
+╚══════════════════════════════════════════════════════════════════╝
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ BEFORE FIRST RUN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Set your Gemini API key (already done if you edited .env):
+   ucp-commerce-agent/.env  →  GEMINI_API_KEY=<your-key>
+
+2. Install dependencies (one-time per service):
+   cd ucp-merchant-server && uv sync
+   cd ucp-commerce-agent  && uv sync
+
+3. Build the frontends (one-time, or after UI changes):
+   cd ucp-merchant-server/frontend && npm install && npm run build
+   cd ucp-commerce-agent/frontend  && npm install && npm run build
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ TERMINAL 1 — Merchant Server (port 8001)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   cd ucp-merchant-server
+   ./run.sh
+
+   OR manually:
+   uv run uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
+
+   Dashboard:  http://localhost:8001/
+   API docs:   http://localhost:8001/docs
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ TERMINAL 2 — Agent Server (port 8000)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+   cd ucp-commerce-agent
+   ./run.sh
+
+   OR manually:
+   uv run uvicorn app.fast_api_app:app --host 0.0.0.0 --port 8000 --reload
+
+   Chat UI:   http://localhost:8000/login
+   API docs:  http://localhost:8000/docs
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ FULL BOOKING FLOW — STEP BY STEP
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Step 1 — Register
+  Open: http://localhost:8000/login
+  Click "Don't have an account? Register"
+  Fill:
+    Email:    john@example.com
+    Password: mypassword
+    PIN:      1234          ← remember this, used to confirm payment
+
+Step 2 — Add money to wallet
+  After login you land on the Wallet page.
+  Click any top-up button:
+    +$5   → adds 500 cents
+    +$10  → adds 1000 cents
+    +$20  → adds 2000 cents
+    +$50  → adds 5000 cents
+  Recommended: add $50 so you can afford any seat type.
+
+Step 3 — Start chatting
+  Click "Chat →" to go to the chat page.
+  The agent automatically starts and greets you — no need to type
+  anything first.
+
+Step 4 — Talk to the LLM agent (natural conversation)
+  The LLM handles everything: discovery, showtimes, seat selection,
+  and confirmation — all through plain English.
+
+  ┌─ SAMPLE CONVERSATION (happy path) ───────────────────────────────
+  │
+  │  You:   "What movies are playing?"
+  │
+  │  Agent: Here's what's playing right now:
+  │         1. Interstellar Redux (Sci-Fi, 169 min, English)
+  │         2. Dune: Messiah (Sci-Fi/Epic, 155 min, English)
+  │         3. Avengers: Kang Dynasty (Action, 148 min, English)
+  │         4. Leo: The Beginning (Action/Thriller, 162 min, Tamil/Hindi)
+  │         Available at PVR Cinemas (Phoenix Mall) and INOX Multiplex (Orion Mall).
+  │         Which one would you like to watch?
+  │
+  │  You:   "I'll go with Dune: Messiah at PVR"
+  │
+  │  Agent: Great choice! Here are the showtimes for Dune: Messiah at PVR:
+  │         Slot A — 10:00 AM  |  Slot B — 2:30 PM
+  │         Slot C —  7:00 PM  |  Slot D — 10:15 PM
+  │         Seat options: Standard $12 | Premium Recliner $18 | IMAX $22
+  │         Which showtime and seat type would you prefer?
+  │
+  │  You:   "Slot C, 2 Premium seats"
+  │
+  │  Agent: Here's your booking summary:
+  │           Movie:    Dune: Messiah
+  │           Theater:  PVR Cinemas, Phoenix Mall
+  │           Showtime: 7:00 PM (Slot C)
+  │           Seats:    Premium Recliner × 2
+  │           Total:    $36.00
+  │         Shall I confirm this booking?
+  │
+  │  You:   "Yes, go ahead"
+  │
+  │  Agent: [proceeds to checkout → PIN modal appears in the UI]
+  │
+  └──────────────────────────────────────────────────────────────────
+
+Step 5 — Confirm payment (PIN modal)
+  A PIN modal will pop up automatically.
+  Enter the PIN you chose during registration (e.g. 1234).
+  Click "Confirm".
+
+Step 6 — Booking confirmed
+  The agent displays your confirmation:
+  - Booking ID
+  - Movie, theater, showtime, seat type and quantity
+  - Total amount charged
+  Your wallet balance is deducted automatically.
+
+Step 7 — Check merchant dashboard
+  Open: http://localhost:8001/
+  Your booking appears in the table within 10 seconds (auto-refresh).
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ SAMPLE INPUTS — THINGS YOU CAN SAY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+── Browse / discover ──────────────────────────────────────────────
+  "What's playing today?"
+  "Show me all movies"
+  "Any sci-fi movies available?"
+  "What action movies do you have?"
+  "What are the Tamil movies?"
+  "Show me movies at INOX"
+  "What's the latest movie at PVR?"
+
+── Showtimes and pricing ───────────────────────────────────────────
+  "What times is Interstellar playing at PVR?"
+  "Show me Avengers showtimes at INOX"
+  "When's the morning show for Leo?"
+  "What's the last show of the day for Dune?"
+  "How much is an IMAX ticket for Interstellar?"
+  "What's the price difference between Standard and Premium?"
+
+── Book in one shot (all details up front) ─────────────────────────
+  "Book 2 Standard seats for Avengers at PVR, evening show"
+  "I want 1 IMAX ticket for Interstellar at PVR morning slot"
+  "Book Leo at INOX, slot D, 2 Premium seats"
+  "Get me 3 Standard tickets for Dune Messiah at INOX, 2:30 PM"
+  "One Premium Recliner for Avengers at PVR, 7 PM"
+
+── Guided booking (agent asks follow-up questions) ─────────────────
+  "I want to watch something tonight"
+  "Book a movie for me, I like sci-fi"
+  "I have 2 friends coming, what should we watch?"
+  "Show me what's good at INOX"
+  "I want the cheapest option for Dune"
+  "Can I get IMAX seats for something today?"
+
+── Changing your mind mid-conversation ─────────────────────────────
+  "Actually, change it to INOX instead"
+  "Make it 3 seats instead of 2"
+  "Let's do the afternoon show instead, slot B"
+  "Switch to Standard seats, Premium is too expensive"
+  "I changed my mind — what else is playing?"
+
+── Cancel ──────────────────────────────────────────────────────────
+  "Cancel"
+  "Never mind, I don't want to book"
+  "Exit"
+  "Stop, I'll book later"
+
+── Reference sheet (slot / seat / theater codes) ───────────────────
+  Slots:    A = 10:00 AM  |  B = 2:30 PM  |  C = 7:00 PM  |  D = 10:15 PM
+  Seats:    S = Standard ($12)  |  P = Premium Recliner ($18)  |  I = IMAX ($22)
+  Theaters: pvr-001 = PVR Cinemas (Phoenix Mall)
+            inox-001 = INOX Multiplex (Orion Mall)
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ AVAILABLE MOVIES (seed data)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  1. Interstellar Redux       — Sci-Fi          — 169 min — English
+  2. Dune: Messiah            — Sci-Fi/Epic      — 155 min — English
+  3. Avengers: Kang Dynasty   — Action           — 148 min — English
+  4. Leo: The Beginning       — Action/Thriller  — 162 min — Tamil/Hindi
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ TESTING EDGE CASES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Insufficient funds:
+  Top up only $2 (200 cents), then say:
+    "Book 1 IMAX ticket for Interstellar at PVR"   ← costs $22
+  The agent should say "Insufficient balance" before showing the PIN modal.
+
+Wrong PIN:
+  In the PIN modal, enter 0000 (wrong PIN).
+  You'll see "Incorrect PIN. Try again."
+  Enter the correct PIN to proceed.
+
+Cancel at PIN modal:
+  In the PIN modal, click "Cancel".
+  The agent acknowledges cancellation and the booking is abandoned.
+
+Cancel mid-conversation (LLM cancel_booking tool):
+  At any point in the conversation say:
+    "Actually cancel, I don't want to book"
+    "Never mind, let's stop"
+    "Exit"
+  The LLM will call cancel_booking and the flow terminates gracefully.
+
+Vague request (agent asks follow-ups):
+  Just say "book a movie" with no other details.
+  The agent should browse movies, ask which one, then ask for theater,
+  showtime, and seat type one by one.
+
+Multiple seat types comparison:
+  "What's the price for all seat types for Avengers at INOX?"
+  The agent should list Standard/Premium/IMAX prices from the showtimes tool.
+
+Book again:
+  After a completed booking, create a new session (refresh or re-login)
+  and start chatting again to book another movie.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ QUICK API SMOKE TESTS (curl)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+# Merchant health
+curl http://localhost:8001/health
+
+# UCP discovery
+curl "http://localhost:8001/.well-known/ucp?theater_id=pvr-001"
+
+# MCP: search movies
+curl -s -X POST http://localhost:8001/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"search_movies","params":{"query":"","limit":5,"theater_id":"pvr-001"}}' \
+  | python3 -m json.tool
+
+# MCP: get showtimes
+curl -s -X POST http://localhost:8001/mcp \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":2,"method":"get_showtimes","params":{"movie_id":"mov-001","theater_id":"pvr-001"}}' \
+  | python3 -m json.tool
+
+# Register a user
+curl -s -X POST http://localhost:8000/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"pass123","pin":"1234"}' \
+  | python3 -m json.tool
+
+# Login
+curl -s -X POST http://localhost:8000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"pass123"}' \
+  | python3 -m json.tool
+
+# Wallet balance (replace TOKEN with the token from login)
+curl "http://localhost:8000/wallet/balance?token=TOKEN"
+
+# Wallet top-up
+curl -s -X POST http://localhost:8000/wallet/topup \
+  -H "Content-Type: application/json" \
+  -d '{"token":"TOKEN","amount_cents":5000}' \
+  | python3 -m json.tool
+
+# Merchant stats
+curl http://localhost:8001/stats
+
+# Merchant bookings
+curl http://localhost:8001/bookings
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ CONFIG FILES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ucp-commerce-agent/.env     ← Gemini API key, model, ports, DB path
+  ucp-merchant-server/.env    ← Merchant port, public base URL, DB path
+
+  To change the model:
+    Edit ucp-commerce-agent/.env  →  MODEL_NAME=gemini-2.5-flash-lite
+
+  To change merchant URL (e.g. staging):
+    Edit ucp-commerce-agent/.env  →  MERCHANT_BASE_URL=https://merchant.example.com
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ KEY PORTS SUMMARY
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  8000  Agent server   (ADK workflow + auth + wallet + chat UI)
+  8001  Merchant server (UCP/MCP/mandate endpoints + dashboard)

@@ -39,3 +39,39 @@ def user_private_key() -> JWK:
 
 def user_public_key() -> JWK:
     return JWK.from_json(user_private_key().export_public())
+
+
+def user_private_key_for(user_id: str) -> JWK:
+    """Load a user's EC private key from the agent DB. Falls back to global key."""
+    try:
+        from app.db import get_conn  # local import to avoid circular at module load
+        conn = get_conn()
+        try:
+            row = conn.execute(
+                "SELECT private_jwk FROM user_keys WHERE user_id=?", (user_id,)
+            ).fetchone()
+            if row:
+                return JWK.from_json(row["private_jwk"])
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    return user_private_key()
+
+
+def user_public_key_for(user_id: str) -> JWK:
+    """Load a user's EC public key from the agent DB. Falls back to global key."""
+    try:
+        from app.db import get_conn
+        conn = get_conn()
+        try:
+            row = conn.execute(
+                "SELECT public_jwk FROM user_keys WHERE user_id=?", (user_id,)
+            ).fetchone()
+            if row:
+                return JWK.from_json(row["public_jwk"])
+        finally:
+            conn.close()
+    except Exception:
+        pass
+    return user_public_key()

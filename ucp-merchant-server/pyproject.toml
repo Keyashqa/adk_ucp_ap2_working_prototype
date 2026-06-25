@@ -1,0 +1,27 @@
+[project]
+name = "ucp-merchant-server"
+version = "0.1.0"
+description = "UCP/AP2 cinema merchant server"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "httpx>=0.28.0",
+    "ap2",
+    "ucp-sdk",
+    "jwcrypto>=1.5.6",
+    "cryptography>=43.0.0",
+    "pydantic>=2.0.0",
+    "python-dotenv>=1.2.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv.sources]
+ap2 = { git = "https://github.com/google-agentic-commerce/AP2.git", rev = "main" }
+ucp-sdk = { git = "https://github.com/Universal-Commerce-Protocol/python-sdk.git", rev = "main" }
+
+[tool.hatch.build.targets.wheel]
+packages = ["app"]

@@ -3,19 +3,17 @@
 
 Graph topology:
   START
-    └─▶ discover_theaters            (automated: UCP BusinessSchema discovery)
-          └─▶ search_movies           (automated: MCP catalog search)
-                └─▶ select_showtime   ← HITL: user picks theater/movie/show/seat/qty
-                      ├─[cancelled]─▶ booking_cancelled_terminal
-                      └─[selected]──▶ create_checkout    (automated: CartMandate via AP2)
-                                        └─▶ verify_booking    (automated: validate CartMandate)
-                                              ├─[invalid]─▶ booking_invalid_terminal
-                                              └─[valid]──▶ authorize_payment  ← HITL: confirm pay
-                                                            ├─[cancelled]─▶ booking_cancelled_terminal
-                                                            └─[confirmed]─▶ sign_ap2_mandates
-                                                                              └─▶ verify_mandates
-                                                                                    ├─[verified]──▶ booking_complete_terminal
-                                                                                    └─[rejected]──▶ sig_rejected_terminal
+    └─▶ conversation_agent  ← LLM agent (multi-turn, tool-calling)
+          ├─[cancelled]─▶ booking_cancelled_terminal
+          └─[selected]──▶ create_checkout    (automated: CartMandate via merchant HTTP)
+                            └─▶ verify_booking    (automated: validate CartMandate)
+                                  ├─[invalid]─▶ booking_invalid_terminal
+                                  └─[valid]──▶ authorize_payment  ← HITL: PIN via UI
+                                                ├─[cancelled]─▶ booking_cancelled_terminal
+                                                └─[confirmed]─▶ sign_ap2_mandates
+                                                                  └─▶ verify_mandates
+                                                                        ├─[verified]──▶ booking_complete_terminal
+                                                                        └─[rejected]──▶ sig_rejected_terminal
 """
 from __future__ import annotations
 
@@ -25,7 +23,6 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-import google.auth
 from ap2.models.mandate import (
     CartContents,
     CartMandate,
@@ -34,38 +31,44 @@ from ap2.models.mandate import (
 )
 from ap2.models.payment_request import (
     PaymentCurrencyAmount,
-    PaymentDetailsInit,
     PaymentItem,
-    PaymentMethodData,
-    PaymentRequest,
     PaymentResponse,
 )
 from ap2.sdk.mandate import MandateClient, SdJwtMandate
+from google import genai
 from google.adk.agents.context import Context
 from google.adk.apps import App, ResumabilityConfig
 from google.adk.events.event import Event
 from google.adk.events.request_input import RequestInput
 from google.adk.workflow import Workflow, node
 from google.genai import types as genai_types
+from jwcrypto.jwk import JWK
 from jwcrypto.jwt import JWT
 
-from app.cinema import MOVIES, SEAT_CATS, SHOWS, THEATER_META, build_ucp_profile, call_mcp
-from app.keys import merchant_private_key, merchant_public_key, user_private_key, user_public_key
+from app.config import MODEL_NAME
+from app.keys import user_private_key_for, user_public_key_for
+from app.merchant_client import MerchantClient
 
-# ── GCP auth ──────────────────────────────────────────────────────────────
-
-_, _project_id = google.auth.default()
-os.environ["GOOGLE_CLOUD_PROJECT"] = _project_id
-os.environ["GOOGLE_CLOUD_LOCATION"] = "global"
-os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "True"
-
-# ── Helpers ────────────────────────────────────────────────────────────────
+# ── Singletons ─────────────────────────────────────────────────────────────────
 
 _SEP = "=" * 60
+_CLIENT = MerchantClient()
 
+# Lazily initialised so the API key is already set in env before first use
+_genai_client: genai.Client | None = None
+
+
+def _get_genai_client() -> genai.Client:
+    global _genai_client
+    if _genai_client is None:
+        _genai_client = genai.Client()
+    return _genai_client
+
+
+# ── Shared helpers ─────────────────────────────────────────────────────────────
 
 def _content(text: str) -> genai_types.Content:
-    return genai_types.Content(role="model", parts=[genai_types.Part.from_text(text=text)])
+    return genai_types.Content(role="model", parts=[genai_types.Part(text=text)])
 
 
 def _ev(output: Any, text: str, route: str | None = None) -> Event:
@@ -75,283 +78,354 @@ def _ev(output: Any, text: str, route: str | None = None) -> Event:
     return Event(**kw)
 
 
-# ── Cart JWT helpers (merchant signs CartContents) ─────────────────────────
-
-def _sign_cart_jwt(contents_dict: dict[str, Any]) -> str:
-    """Sign CartContents as a compact JWT using the theater's merchant key."""
-    tok = JWT(
-        header=json.dumps({"alg": "ES256", "typ": "JWT", "kid": "merchant"}),
-        claims=json.dumps(contents_dict, default=str),
-    )
-    tok.make_signed_token(merchant_private_key())
-    return tok.serialize()
-
-
-def _verify_cart_jwt(jwt_str: str) -> bool:
-    """Verify the merchant JWT signature over CartContents."""
+def _verify_cart_jwt(jwt_str: str, merchant_public_jwk_dict: dict) -> bool:
     try:
-        JWT(key=merchant_public_key(), jwt=jwt_str)
+        key = JWK.from_json(json.dumps(merchant_public_jwk_dict))
+        JWT(key=key, jwt=jwt_str)
         return True
     except Exception:
         return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 1 — discover_theaters
-# Automated: build real UCP BusinessSchema profiles for all registered theaters
+# Conversation-agent tools (FunctionDeclarations for Gemini)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def discover_theaters(node_input: Any) -> Any:
-    """Build UCP BusinessSchema profiles for every theater and return summaries."""
-    theater_list = []
-    for tid, meta in THEATER_META.items():
-        profile = build_ucp_profile(tid)
-        theater_list.append({
-            "theater_id":      tid,
-            "theater_name":    meta["name"],
-            "location":        meta["location"],
-            "mcp_endpoint":    meta["mcp_endpoint"],
-            "ucp_version":     profile.version.root,
-            "capabilities":    list((profile.capabilities or {}).keys()),
-            "payment_handlers": list(profile.payment_handlers.keys()),
-        })
+_CINEMA_TOOLS = genai_types.Tool(function_declarations=[
+    genai_types.FunctionDeclaration(
+        name="search_movies",
+        description=(
+            "Fetch the list of available movies and theaters from the cinema. "
+            "Call this first when the user asks what's playing or wants to browse."
+        ),
+        parameters=genai_types.Schema(
+            type=genai_types.Type.OBJECT,
+            properties={
+                "query": genai_types.Schema(
+                    type=genai_types.Type.STRING,
+                    description="Optional search term; leave empty to get all movies.",
+                ),
+            },
+        ),
+    ),
+    genai_types.FunctionDeclaration(
+        name="get_showtimes",
+        description=(
+            "Get available showtimes for a specific movie at a specific theater. "
+            "Use when the user has picked a movie and wants to know what times are available."
+        ),
+        parameters=genai_types.Schema(
+            type=genai_types.Type.OBJECT,
+            properties={
+                "theater_id": genai_types.Schema(
+                    type=genai_types.Type.STRING,
+                    description="Theater ID, e.g. pvr-001 or inox-001",
+                ),
+                "movie_id": genai_types.Schema(
+                    type=genai_types.Type.STRING,
+                    description="Movie ID returned by search_movies",
+                ),
+            },
+            required=["theater_id", "movie_id"],
+        ),
+    ),
+    genai_types.FunctionDeclaration(
+        name="confirm_booking",
+        description=(
+            "Call this ONLY once the user has explicitly agreed to all booking details: "
+            "theater, movie, showtime slot, seat type, and number of seats. "
+            "Do NOT call this unless the user has confirmed."
+        ),
+        parameters=genai_types.Schema(
+            type=genai_types.Type.OBJECT,
+            properties={
+                "theater_id":  genai_types.Schema(type=genai_types.Type.STRING, description="e.g. pvr-001 or inox-001"),
+                "movie_id":    genai_types.Schema(type=genai_types.Type.STRING, description="Movie ID from search_movies"),
+                "movie_title": genai_types.Schema(type=genai_types.Type.STRING, description="Movie title for display"),
+                "slot":        genai_types.Schema(type=genai_types.Type.STRING, description="Slot letter: A=10:00 AM, B=2:30 PM, C=7:00 PM, D=10:15 PM"),
+                "seat_code":   genai_types.Schema(type=genai_types.Type.STRING, description="S=Standard, P=Premium Recliner, I=IMAX"),
+                "qty":         genai_types.Schema(type=genai_types.Type.INTEGER, description="Number of tickets (1–6)"),
+            },
+            required=["theater_id", "movie_id", "movie_title", "slot", "seat_code", "qty"],
+        ),
+    ),
+    genai_types.FunctionDeclaration(
+        name="cancel_booking",
+        description="Call this if the user explicitly wants to stop or cancel the booking process.",
+        parameters=genai_types.Schema(type=genai_types.Type.OBJECT, properties={}),
+    ),
+])
 
-    lines = "\n".join(
-        f"  [{t['theater_id']}]  {t['theater_name']}  —  {t['location']}"
-        for t in theater_list
-    )
-    summary = (
-        f"\n{_SEP}\n"
-        f"  NODE 1 · Theater Discovery (UCP)\n"
-        f"{_SEP}\n"
-        f"{lines}\n"
-        f"  UCP version: {theater_list[0]['ucp_version']}\n"
-        f"{_SEP}\n"
-    )
-    return Event(
-        output=theater_list,
-        state={"theaters": theater_list},
-        content=_content(summary),
-    )
+_SYSTEM_PROMPT = """\
+You are a friendly cinema booking assistant for a multiplex ticketing app.
+Help the user discover movies and book tickets through natural conversation.
+
+Available theaters:
+  • pvr-001  — PVR Cinemas, Phoenix Mall
+  • inox-001 — INOX Multiplex, Orion Mall
+
+Showtime slots:  A = 10:00 AM  |  B = 2:30 PM  |  C = 7:00 PM  |  D = 10:15 PM
+Seat categories: S = Standard ($12)  |  P = Premium Recliner ($18)  |  I = IMAX ($22)
+
+Workflow:
+1. When the conversation starts, call search_movies to get the current catalog.
+2. Show the movies in a readable format and ask what the user wants to watch.
+3. If the user asks about times, call get_showtimes for that movie + theater.
+4. Guide the user to pick: theater → movie → showtime → seat type → number of seats.
+5. Summarise the selection and ask the user to confirm.
+6. Once confirmed, call confirm_booking with all required details.
+7. If the user wants to quit at any point, call cancel_booking.
+
+Keep responses concise and conversational. Show prices when relevant.
+"""
+
+
+# ── History serialisation (state must be JSON-safe) ───────────────────────────
+
+def _pack_history(contents: list[genai_types.Content]) -> list[dict]:
+    """Convert Content objects → plain dicts for state storage."""
+    out = []
+    for c in contents:
+        parts = []
+        for p in c.parts:
+            if p.text:
+                parts.append({"text": p.text})
+            elif p.function_call:
+                parts.append({"function_call": {
+                    "name": p.function_call.name,
+                    "args": dict(p.function_call.args or {}),
+                }})
+            elif p.function_response:
+                parts.append({"function_response": {
+                    "name": p.function_response.name,
+                    "response": dict(p.function_response.response or {}),
+                }})
+        if parts:
+            out.append({"role": c.role, "parts": parts})
+    return out
+
+
+def _unpack_history(history: list[dict]) -> list[genai_types.Content]:
+    """Convert plain dicts → Content objects for the Gemini API."""
+    contents = []
+    for item in history:
+        parts = []
+        for p in item.get("parts", []):
+            if "text" in p:
+                parts.append(genai_types.Part(text=p["text"]))
+            elif "function_call" in p:
+                fc = p["function_call"]
+                parts.append(genai_types.Part(
+                    function_call=genai_types.FunctionCall(
+                        name=fc["name"], args=fc.get("args", {})
+                    )
+                ))
+            elif "function_response" in p:
+                fr = p["function_response"]
+                parts.append(genai_types.Part(
+                    function_response=genai_types.FunctionResponse(
+                        name=fr["name"], response=fr.get("response", {})
+                    )
+                ))
+        if parts:
+            contents.append(genai_types.Content(role=item["role"], parts=parts))
+    return contents
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 2 — search_movies
-# Automated: MCP search_movies across every discovered theater
-# ══════════════════════════════════════════════════════════════════════════════
-
-def search_movies(node_input: list[dict[str, Any]]) -> Any:
-    """Query each theater's MCP endpoint and return a deduplicated movie catalog."""
-    all_movies: dict[str, dict[str, Any]] = {}
-    for theater in node_input:
-        rsp = call_mcp("search_movies", {"query": "", "limit": 10}, theater["theater_id"])
-        for m in rsp.get("result", {}).get("movies", []):
-            if m["movie_id"] not in all_movies:
-                all_movies[m["movie_id"]] = {**m, "available_at": []}
-            all_movies[m["movie_id"]]["available_at"].append(theater["theater_id"])
-
-    movie_list  = list(all_movies.values())
-    movie_lines = "\n".join(
-        f"  {i + 1}. {m['title']} ({m['genre']}, {m['duration_min']}min, {m['language']})"
-        f"  [{', '.join(m['available_at'])}]"
-        for i, m in enumerate(movie_list)
-    )
-    slot_lines = "\n".join(
-        f"  {s['slot']}. {s['time']}  ({s['seats_left']} seats left)" for s in SHOWS
-    )
-    seat_lines = "\n".join(
-        f"  {k}. {v['label']}  —  ${v['price_cents'] / 100:.2f}" for k, v in SEAT_CATS.items()
-    )
-
-    summary = (
-        f"\n{_SEP}\n"
-        f"  NODE 2 · Movie Catalog (MCP)\n"
-        f"{_SEP}\n"
-        f"  MOVIES:\n{movie_lines}\n\n"
-        f"  SHOWTIMES:\n{slot_lines}\n\n"
-        f"  SEAT CATEGORIES:\n{seat_lines}\n"
-        f"{_SEP}\n"
-    )
-    return Event(
-        output={"movies": movie_list, "index": {str(i + 1): m for i, m in enumerate(movie_list)}},
-        state={"movies": movie_list},
-        content=_content(summary),
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# NODE 3 — select_showtime   [HUMAN-IN-THE-LOOP]
-# Pause: user picks theater · movie · slot · seat · qty
-# Resume: parse input → route "selected" or "cancelled"
+# NODE 1 — conversation_agent   [LLM + HITL multi-turn]
+#
+# Runs Gemini with tool-calling in a loop:
+#   • text response  → show to user, issue RequestInput, pause
+#   • tool call      → execute, feed result back, loop
+#   • confirm_booking → route "selected" to create_checkout
+#   • cancel_booking  → route "cancelled"
 # ══════════════════════════════════════════════════════════════════════════════
 
 @node(rerun_on_resume=True)
-async def select_showtime(ctx: Context, node_input: dict[str, Any]):
-    """Prompt the user to choose their movie, showtime, seat type, and quantity."""
-    movies = node_input.get("movies", [])
+async def conversation_agent(ctx: Context, node_input: Any):
+    client = _get_genai_client()
 
-    if "showtime_selection" not in ctx.resume_inputs:
-        movie_lines = "\n".join(
-            f"    {i + 1}. {m['title']} ({m['genre']})  [{', '.join(m['available_at'])}]"
-            for i, m in enumerate(movies)
+    # ── First invocation: fetch UCP profile, greet the user ───────────────────
+    if "chat_history" not in ctx.state:
+        profile = await _CLIENT.fetch_ucp_profile()
+        ctx.state["merchant_public_jwk"] = profile.get("merchant_public_jwk", {})
+
+        welcome = (
+            "🎬 Welcome to CineAgent! I can help you find and book movie tickets.\n"
+            "What would you like to watch today?"
         )
-        prompt = (
-            f"\n{_SEP}\n"
-            f"  NODE 3 · SELECT YOUR BOOKING\n"
-            f"{_SEP}\n"
-            f"  THEATERS:\n"
-            f"    pvr  = PVR Cinemas (Phoenix Mall)\n"
-            f"    inox = INOX Multiplex (Orion Mall)\n\n"
-            f"  MOVIES:\n{movie_lines}\n\n"
-            f"  SHOWTIMES:  A = 10:00 AM   B = 2:30 PM   C = 7:00 PM   D = 10:15 PM\n"
-            f"  SEATS:      S = Standard ($12)   P = Premium ($18)   I = IMAX ($22)\n\n"
-            f"  Format: <theater> <movie#> <slot> <seat> <qty>\n"
-            f"  Example: pvr 1 C P 2  →  PVR · Interstellar Redux · 7PM · Premium · 2 tickets\n"
-            f"{_SEP}\n"
-        )
-        yield _content(prompt)
-        yield RequestInput(interrupt_id="showtime_selection", message=prompt)
+        ctx.state["chat_history"] = _pack_history([
+            genai_types.Content(role="model", parts=[genai_types.Part(text=welcome)])
+        ])
+
+        yield Event(content=_content(welcome))
+        yield RequestInput(interrupt_id="chat_turn", message=welcome)
         return
 
-    raw   = str(ctx.resume_inputs.get("showtime_selection", "")).strip()
-    parts = raw.split()
+    # ── Resumed: get the user's latest message ────────────────────────────────
+    user_msg = str(ctx.resume_inputs.get("chat_turn", "")).strip()
+    if not user_msg:
+        yield RequestInput(interrupt_id="chat_turn", message="What would you like to do?")
+        return
 
-    if len(parts) < 5:
-        yield Event(
-            output={"error": "incomplete_input", "raw": raw},
-            route="cancelled",
-            content=_content(
-                f"  ✗ Input '{raw}' is incomplete.\n"
-                f"  Need: <theater> <movie#> <slot> <seat> <qty>\n"
-                f"  Booking cancelled."
+    history: list[dict] = list(ctx.state.get("chat_history", []))
+    history.append({"role": "user", "parts": [{"text": user_msg}]})
+
+    # ── Inner loop: LLM → tool call → result → LLM … until text or terminal ──
+    while True:
+        response = await client.aio.models.generate_content(
+            model=MODEL_NAME,
+            contents=_unpack_history(history),
+            config=genai_types.GenerateContentConfig(
+                system_instruction=_SYSTEM_PROMPT,
+                tools=[_CINEMA_TOOLS],
             ),
         )
-        return
 
-    theater_key, movie_num, slot, seat, qty_str = (
-        parts[0], parts[1], parts[2].upper(), parts[3].upper(), parts[4]
-    )
-    theater_id  = "pvr-001" if theater_key.lower().startswith("pvr") else "inox-001"
-    movie_idx   = int(movie_num) - 1 if movie_num.isdigit() and 1 <= int(movie_num) <= len(movies) else 0
-    movie       = movies[movie_idx]
-    qty         = max(1, min(6, int(qty_str) if qty_str.isdigit() else 1))
-    show        = next((s for s in SHOWS if s["slot"] == slot), SHOWS[2])
-    seat_info   = SEAT_CATS.get(seat, SEAT_CATS["S"])
+        raw_parts = response.candidates[0].content.parts
+        fc_parts  = [p for p in raw_parts if getattr(p, "function_call", None)
+                     and p.function_call.name]
 
-    selection = {
-        "theater_id":   theater_id,
-        "movie_id":     movie["movie_id"],
-        "movie_title":  movie["title"],
-        "slot":         slot,
-        "seat":         seat,
-        "qty":          qty,
-    }
+        # ── Branch: function call ──────────────────────────────────────────────
+        if fc_parts:
+            fc   = fc_parts[0].function_call
+            args = dict(fc.args or {})
+            history.append({"role": "model", "parts": [{"function_call": {"name": fc.name, "args": args}}]})
 
-    yield Event(
-        output=selection,
-        state={"selection": selection},
-        route="selected",
-        content=_content(
-            f"  ✓ Selected: {movie['title']} · {show['time']} · "
-            f"{seat_info['label']} x{qty}  ({THEATER_META[theater_id]['name']})"
-        ),
-    )
+            # Terminal: user confirmed booking
+            if fc.name == "confirm_booking":
+                selection = {
+                    "theater_id":          args.get("theater_id", "pvr-001"),
+                    "movie_id":            args.get("movie_id", ""),
+                    "movie_title":         args.get("movie_title", ""),
+                    "slot":                args.get("slot", "A").upper(),
+                    "seat":                args.get("seat_code", "S").upper(),
+                    "qty":                 max(1, min(6, int(args.get("qty", 1)))),
+                    "merchant_public_jwk": ctx.state.get("merchant_public_jwk", {}),
+                }
+                msg = (
+                    f"✓ Got it! Booking **{selection['movie_title']}**\n"
+                    f"  Slot {selection['slot']} · {selection['seat']} × {selection['qty']} seat(s)\n"
+                    f"  Proceeding to checkout…"
+                )
+                yield Event(output=selection, route="selected", content=_content(msg))
+                return
+
+            # Terminal: user cancelled
+            if fc.name == "cancel_booking":
+                yield Event(
+                    output={},
+                    route="cancelled",
+                    content=_content("👋 Booking cancelled. Come back whenever you'd like to watch something!"),
+                )
+                return
+
+            # Data tool: search_movies
+            if fc.name == "search_movies":
+                result = await _CLIENT.mcp_call("search_movies", {
+                    "query":     args.get("query", ""),
+                    "limit":     20,
+                    "theater_id": "pvr-001",
+                })
+                tool_data = result.get("result", {})
+
+            # Data tool: get_showtimes
+            elif fc.name == "get_showtimes":
+                result = await _CLIENT.mcp_call("get_showtimes", {
+                    "movie_id":  args.get("movie_id", ""),
+                    "theater_id": args.get("theater_id", "pvr-001"),
+                })
+                tool_data = result.get("result", {})
+
+            else:
+                tool_data = {"error": f"Unknown tool: {fc.name}"}
+
+            history.append({
+                "role": "user",
+                "parts": [{"function_response": {"name": fc.name, "response": tool_data}}],
+            })
+            # Loop back → LLM processes tool result
+
+        # ── Branch: text response → show to user, wait for next turn ──────────
+        else:
+            text = "\n".join(
+                p.text for p in raw_parts if getattr(p, "text", None)
+            ).strip() or "…"
+
+            history.append({"role": "model", "parts": [{"text": text}]})
+            ctx.state["chat_history"] = history
+
+            yield Event(content=_content(text))
+            yield RequestInput(interrupt_id="chat_turn", message=text)
+            return
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 4 — create_checkout
-# Automated: MCP create_checkout → AP2 CartContents → merchant-signed CartMandate
+# NODE 2 — create_checkout
+# Automated: real HTTP MCP create_checkout → merchant-signed CartMandate returned
 # ══════════════════════════════════════════════════════════════════════════════
 
-def create_checkout(node_input: dict[str, Any]) -> Any:
-    """Call MCP create_checkout and produce a merchant-signed AP2 CartMandate."""
+async def create_checkout(node_input: dict[str, Any]) -> Any:
+    """Call merchant MCP create_checkout — merchant signs and returns CartMandate."""
     sel = node_input
-
-    checkout = call_mcp(
+    rsp = await _CLIENT.mcp_call(
         "create_checkout",
         {
-            "movie_id": sel["movie_id"],
-            "slot":     sel["slot"],
-            "seat":     sel["seat"],
-            "qty":      sel["qty"],
+            "movie_id":   sel["movie_id"],
+            "slot":       sel["slot"],
+            "seat":       sel["seat"],
+            "qty":        sel["qty"],
+            "theater_id": sel["theater_id"],
         },
-        sel["theater_id"],
-    ).get("result", {})
-
-    total_cents = checkout["total_cents"]
-    session_id  = checkout["session_id"]
-    expires_at  = checkout["expires_at"]
-    seat_label  = checkout["seat"]["label"]
-    movie_title = checkout["movie"]["title"]
-    show_time   = checkout["show"]["time"]
-
-    # AP2 W3C PaymentRequest
-    display_label = f"{sel['qty']}x {seat_label} — {movie_title} ({show_time})"
-    payment_request = PaymentRequest(
-        method_data=[PaymentMethodData(supported_methods="card")],
-        details=PaymentDetailsInit(
-            id=session_id,
-            display_items=[
-                PaymentItem(
-                    label=display_label,
-                    amount=PaymentCurrencyAmount(currency="USD", value=total_cents / 100),
-                )
-            ],
-            total=PaymentItem(
-                label="Total",
-                amount=PaymentCurrencyAmount(currency="USD", value=total_cents / 100),
-            ),
-        ),
     )
+    checkout = rsp.get("result", {})
 
-    # AP2 CartContents
-    contents = CartContents(
-        id=session_id,
-        user_cart_confirmation_required=True,
-        payment_request=payment_request,
-        cart_expiry=expires_at,
-        merchant_name=checkout["theater_name"],
-    )
-
-    # Merchant signs CartContents → CartMandate
-    merchant_auth = _sign_cart_jwt(contents.model_dump())
-    cart_mandate  = CartMandate(contents=contents, merchant_authorization=merchant_auth)
+    total_cents   = checkout["total_cents"]
+    session_id    = checkout["session_id"]
+    expires_at    = checkout["expires_at"]
+    seat_label    = checkout["seat"]["label"]
+    movie_title   = checkout["movie"]["title"]
+    show_time     = checkout["show"]["time_label"]
+    merchant_auth = checkout["cart_mandate"].get("merchant_authorization", "")
 
     msg = (
         f"\n{_SEP}\n"
-        f"  NODE 4 · Checkout & CartMandate (AP2)\n"
+        f"  Checkout & CartMandate (AP2)\n"
         f"{_SEP}\n"
         f"  Session:      {session_id}\n"
         f"  Theater:      {checkout['theater_name']}\n"
         f"  Movie:        {movie_title}\n"
         f"  Showtime:     {show_time}\n"
-        f"  Seats:        {seat_label} x{sel['qty']}\n"
+        f"  Seats:        {seat_label} × {sel['qty']}\n"
         f"  Total:        ${total_cents / 100:.2f} USD\n"
         f"  Expires:      {expires_at}\n"
-        f"  Merchant sig: {merchant_auth[:52]}...\n"
+        f"  Merchant sig: {merchant_auth[:52]}…\n"
         f"{_SEP}\n"
     )
-
     payload = {
-        "cart_mandate": cart_mandate.model_dump(),
-        "checkout":     checkout,
-        "total_cents":  total_cents,
-        "session_id":   session_id,
+        "cart_mandate":        checkout["cart_mandate"],
+        "checkout":            checkout,
+        "total_cents":         total_cents,
+        "session_id":          session_id,
+        "merchant_public_jwk": sel.get("merchant_public_jwk", {}),
     }
-    return Event(output=payload, state={"cart_mandate": cart_mandate.model_dump()}, content=_content(msg))
+    return Event(output=payload, state={"cart_mandate": checkout["cart_mandate"]}, content=_content(msg))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 5 — verify_booking
-# Automated: expiry check + merchant JWT verification on CartMandate
+# NODE 3 — verify_booking
+# Automated: expiry check + merchant JWT verification
 # Routes → "valid" | "invalid"
 # ══════════════════════════════════════════════════════════════════════════════
 
-def verify_booking(node_input: dict[str, Any]) -> Any:
-    """Validate CartMandate: required fields, price-lock expiry, merchant signature."""
-    cart      = CartMandate(**node_input["cart_mandate"])
+async def verify_booking(node_input: dict[str, Any]) -> Any:
+    cart_data = node_input["cart_mandate"]
+    cart      = CartMandate(**cart_data)
     contents  = cart.contents
     issues: list[str] = []
+
+    merchant_public_jwk = node_input.get("merchant_public_jwk", {})
 
     try:
         expiry = datetime.fromisoformat(contents.cart_expiry.replace("Z", "+00:00"))
@@ -361,7 +435,7 @@ def verify_booking(node_input: dict[str, Any]) -> Any:
         issues.append("invalid expiry format")
 
     if cart.merchant_authorization:
-        if not _verify_cart_jwt(cart.merchant_authorization):
+        if not _verify_cart_jwt(cart.merchant_authorization, merchant_public_jwk):
             issues.append("merchant signature invalid")
     else:
         issues.append("missing merchant_authorization")
@@ -369,19 +443,19 @@ def verify_booking(node_input: dict[str, Any]) -> Any:
     if not issues:
         msg = (
             f"\n{_SEP}\n"
-            f"  NODE 5 · CartMandate Verified ✓\n"
+            f"  CartMandate Verified ✓\n"
             f"{_SEP}\n"
             f"  Merchant: {contents.merchant_name}\n"
             f"  Cart ID:  {contents.id}\n"
             f"  Total:    ${node_input['total_cents'] / 100:.2f} USD\n"
-            f"  Sig:      VALID  |  Expiry: VALID\n"
+            f"  Sig: VALID  |  Expiry: VALID\n"
             f"{_SEP}\n"
         )
         return Event(output=node_input, route="valid", content=_content(msg))
 
     msg = (
         f"\n{_SEP}\n"
-        f"  NODE 5 · CartMandate INVALID\n"
+        f"  CartMandate INVALID\n"
         f"{_SEP}\n"
         f"  Issues: {', '.join(issues)}\n"
         f"{_SEP}\n"
@@ -390,34 +464,49 @@ def verify_booking(node_input: dict[str, Any]) -> Any:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 6 — authorize_payment   [HUMAN-IN-THE-LOOP]
-# Shows full booking summary; user must type "confirm" or "cancel"
+# NODE 4 — authorize_payment   [HUMAN-IN-THE-LOOP]
+# Checks wallet balance first, then pauses for PIN (via React UI PinModal).
 # Routes → "confirmed" | "cancelled"
 # ══════════════════════════════════════════════════════════════════════════════
 
 @node(rerun_on_resume=True)
 async def authorize_payment(ctx: Context, node_input: dict[str, Any]):
-    """Require explicit user confirmation before AP2 mandate signing."""
     checkout    = node_input.get("checkout", {})
     total_cents = node_input.get("total_cents", 0)
 
     if "payment_auth" not in ctx.resume_inputs:
+        user_id = ctx.state.get("user_id")
+        if user_id:
+            from app import wallet as wallet_ops
+            balance = await wallet_ops.get_balance(user_id)
+            if balance < total_cents:
+                yield Event(
+                    output=node_input,
+                    route="cancelled",
+                    content=_content(
+                        f"  ✗ Insufficient wallet balance "
+                        f"(${balance / 100:.2f} available, ${total_cents / 100:.2f} required).\n"
+                        f"  Please top up your wallet and try again."
+                    ),
+                )
+                return
+
         movie = checkout.get("movie", {})
         show  = checkout.get("show", {})
         seat  = checkout.get("seat", {})
         qty   = checkout.get("qty", "?")
         prompt = (
             f"\n{_SEP}\n"
-            f"  NODE 6 · PAYMENT AUTHORIZATION REQUIRED\n"
+            f"  PAYMENT AUTHORIZATION REQUIRED\n"
             f"{_SEP}\n"
             f"  Movie:      {movie.get('title', '?')}\n"
-            f"  Showtime:   {show.get('time', '?')}\n"
-            f"  Seats:      {seat.get('label', '?')} x{qty}\n"
+            f"  Showtime:   {show.get('time_label', show.get('time', '?'))}\n"
+            f"  Seats:      {seat.get('label', '?')} × {qty}\n"
             f"  Theater:    {checkout.get('theater_name', '?')}\n"
             f"  ──────────────────────────────────────\n"
             f"  TOTAL:      ${total_cents / 100:.2f} USD\n"
             f"{_SEP}\n"
-            f"\n  Type 'confirm' to pay or 'cancel' to abort.\n"
+            f"\n  Enter your PIN to confirm payment.\n"
         )
         yield _content(prompt)
         yield RequestInput(interrupt_id="payment_auth", message=prompt)
@@ -426,30 +515,28 @@ async def authorize_payment(ctx: Context, node_input: dict[str, Any]):
     response = str(ctx.resume_inputs.get("payment_auth", "")).lower().strip()
     if "confirm" in response:
         yield Event(
-            output=node_input,
+            output={**node_input, "user_id": ctx.state.get("user_id", "anonymous")},
             route="confirmed",
-            content=_content(
-                f"  ✓ Payment confirmed (${total_cents / 100:.2f}). Signing AP2 mandates..."
-            ),
+            content=_content(f"  ✓ Payment confirmed (${total_cents / 100:.2f}). Signing AP2 mandates…"),
         )
     else:
         yield Event(
             output=node_input,
             route="cancelled",
-            content=_content(f"  ✗ Booking cancelled by user ('{response}')."),
+            content=_content(f"  ✗ Booking cancelled."),
         )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 7 — sign_ap2_mandates
-# Automated: PaymentMandateContents → SD-JWT via real AP2 MandateClient
+# NODE 5 — sign_ap2_mandates
+# Automated: PaymentMandateContents → SD-JWT using per-user key from agent DB
 # ══════════════════════════════════════════════════════════════════════════════
 
-def sign_ap2_mandates(node_input: dict[str, Any]) -> Any:
-    """Build and cryptographically sign an AP2 PaymentMandate as SD-JWT."""
+async def sign_ap2_mandates(node_input: dict[str, Any]) -> Any:
     checkout    = node_input["checkout"]
     total_cents = node_input["total_cents"]
     session_id  = node_input["session_id"]
+    user_id     = node_input.get("user_id", "anonymous")
 
     pmc = PaymentMandateContents(
         payment_mandate_id=f"pm-{uuid.uuid4().hex[:12]}",
@@ -467,8 +554,8 @@ def sign_ap2_mandates(node_input: dict[str, Any]) -> Any:
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
 
-    # Sign PaymentMandateContents as AP2 SD-JWT using user's private key
-    sd_jwt_str = MandateClient().create(payloads=[pmc], issuer_key=user_private_key())
+    private_key = user_private_key_for(user_id)
+    sd_jwt_str  = MandateClient().create(payloads=[pmc], issuer_key=private_key)
 
     payment_mandate = PaymentMandate(
         payment_mandate_contents=pmc,
@@ -477,20 +564,20 @@ def sign_ap2_mandates(node_input: dict[str, Any]) -> Any:
 
     msg = (
         f"\n{_SEP}\n"
-        f"  NODE 7 · AP2 PaymentMandate Signed (SD-JWT)\n"
+        f"  AP2 PaymentMandate Signed (SD-JWT)\n"
         f"{_SEP}\n"
         f"  Mandate ID: {pmc.payment_mandate_id}\n"
         f"  Session:    {session_id}\n"
         f"  Amount:     ${total_cents / 100:.2f} USD\n"
-        f"  SD-JWT:     {sd_jwt_str[:60]}...\n"
+        f"  SD-JWT:     {sd_jwt_str[:60]}…\n"
         f"{_SEP}\n"
     )
-
     return Event(
         output={
             **node_input,
             "payment_mandate": payment_mandate.model_dump(),
             "payment_sd_jwt":  sd_jwt_str,
+            "user_id":         user_id,
         },
         state={"payment_mandate": payment_mandate.model_dump()},
         content=_content(msg),
@@ -498,56 +585,70 @@ def sign_ap2_mandates(node_input: dict[str, Any]) -> Any:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 8 — verify_mandates   [HUMAN-IN-THE-LOOP if verification fails]
-# Verifies CartMandate merchant JWT + PaymentMandate SD-JWT.
-# Auto-routes "verified" if both pass; HITL on any failure.
+# NODE 6 — verify_mandates
+# Verifies CartMandate JWT + PaymentMandate SD-JWT locally, then POST to merchant.
 # Routes → "verified" | "rejected"
 # ══════════════════════════════════════════════════════════════════════════════
 
 @node(rerun_on_resume=True)
 async def verify_mandates(ctx: Context, node_input: dict[str, Any]):
-    """Verify both mandates; escalate to human reviewer on any failure."""
     if "mandate_review" not in ctx.resume_inputs:
-        cart       = CartMandate(**node_input["cart_mandate"])
-        sd_jwt_str = node_input["payment_sd_jwt"]
+        cart            = CartMandate(**node_input["cart_mandate"])
+        sd_jwt_str      = node_input["payment_sd_jwt"]
+        user_id         = node_input.get("user_id", ctx.state.get("user_id", "anonymous"))
+        user_public_jwk = ctx.state.get("user_public_jwk", {})
+        merchant_jwk    = ctx.state.get("merchant_public_jwk", {})
         issues: list[str] = []
 
-        # 1. Re-verify merchant CartMandate JWT
-        if not _verify_cart_jwt(cart.merchant_authorization or ""):
+        if not _verify_cart_jwt(cart.merchant_authorization or "", merchant_jwk):
             issues.append("CartMandate merchant signature invalid")
 
-        # 2. Verify AP2 PaymentMandate SD-JWT (via SdJwtMandate.from_sd_jwt)
         try:
+            pub_key = user_public_key_for(user_id)
             SdJwtMandate.from_sd_jwt(
                 compact_serialization=sd_jwt_str,
-                issuer_public_key=user_public_key(),
+                issuer_public_key=pub_key,
                 payload_type=PaymentMandateContents,
             )
         except Exception as exc:
             issues.append(f"PaymentMandate SD-JWT: {exc}")
 
         if not issues:
-            msg = (
-                f"\n{_SEP}\n"
-                f"  NODE 8 · Double-Mandate Verification PASSED ✓\n"
-                f"{_SEP}\n"
-                f"  CartMandate   (merchant JWT):  VALID\n"
-                f"  PaymentMandate (AP2 SD-JWT):   VALID\n"
-                f"{_SEP}\n"
-            )
-            yield Event(
-                output={**node_input, "verified": True},
-                route="verified",
-                content=_content(msg),
-            )
-            return
+            try:
+                result = await _CLIENT.verify_mandate(
+                    session_id=node_input["session_id"],
+                    cart_mandate=node_input["cart_mandate"],
+                    payment_sd_jwt=sd_jwt_str,
+                    user_public_jwk=user_public_jwk,
+                )
+                if not result.get("verified"):
+                    issues.append(f"Merchant rejected: {result.get('error', 'unknown')}")
+                else:
+                    booking_id = result.get("booking_id", "")
+                    msg = (
+                        f"\n{_SEP}\n"
+                        f"  Double-Mandate Verification PASSED ✓\n"
+                        f"{_SEP}\n"
+                        f"  CartMandate   (merchant JWT):  VALID\n"
+                        f"  PaymentMandate (AP2 SD-JWT):   VALID\n"
+                        f"  Merchant confirmed booking ID: {booking_id}\n"
+                        f"{_SEP}\n"
+                    )
+                    yield Event(
+                        output={**node_input, "verified": True, "booking_id": booking_id, "user_id": user_id},
+                        route="verified",
+                        content=_content(msg),
+                    )
+                    return
+            except Exception as exc:
+                issues.append(f"Merchant verification HTTP error: {exc}")
 
-        # Pause for human review
+        # Pause for human review on failure
         yield Event(state={"verification_issues": issues})
         issue_lines = "\n".join(f"    • {i}" for i in issues)
         prompt = (
             f"\n{_SEP}\n"
-            f"  NODE 8 · MANDATE VERIFICATION FAILED — HUMAN REVIEW\n"
+            f"  MANDATE VERIFICATION FAILED — HUMAN REVIEW\n"
             f"{_SEP}\n"
             f"  Issues:\n{issue_lines}\n"
             f"{_SEP}\n"
@@ -557,7 +658,6 @@ async def verify_mandates(ctx: Context, node_input: dict[str, Any]):
         yield RequestInput(interrupt_id="mandate_review", message=prompt)
         return
 
-    # Resume pass: human decision
     response = str(ctx.resume_inputs.get("mandate_review", "")).lower().strip()
     issues   = ctx.state.get("verification_issues", [])
 
@@ -576,64 +676,72 @@ async def verify_mandates(ctx: Context, node_input: dict[str, Any]):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Terminal Nodes
+# Terminal nodes
 # ══════════════════════════════════════════════════════════════════════════════
 
-def booking_complete_terminal(node_input: dict[str, Any]) -> Any:
+async def booking_complete_terminal(node_input: dict[str, Any]) -> Any:
     checkout    = node_input.get("checkout", {})
     total_cents = node_input.get("total_cents", 0)
+    session_id  = node_input.get("session_id", "")
+    booking_id  = node_input.get("booking_id", "")
     note        = "  Note:     Human override applied\n" if node_input.get("override") else ""
+
+    user_id = node_input.get("user_id")
+    if user_id and total_cents:
+        try:
+            from app import wallet as wallet_ops
+            await wallet_ops.deduct(user_id, total_cents, reason="booking", reference_id=session_id)
+        except Exception as exc:
+            note += f"  Wallet deduction failed: {exc}\n"
+
     msg = (
         f"\n{_SEP}\n"
-        f"  BOOKING CONFIRMED!\n"
+        f"  🎉 BOOKING CONFIRMED!\n"
         f"{_SEP}\n"
-        f"  Movie:    {checkout.get('movie', {}).get('title', '?')}\n"
-        f"  Theater:  {checkout.get('theater_name', '?')}\n"
-        f"  Showtime: {checkout.get('show', {}).get('time', '?')}\n"
-        f"  Seats:    {checkout.get('seat', {}).get('label', '?')} x{checkout.get('qty', '?')}\n"
-        f"  Charged:  ${total_cents / 100:.2f} USD\n"
+        f"  Movie:      {checkout.get('movie', {}).get('title', '?')}\n"
+        f"  Theater:    {checkout.get('theater_name', '?')}\n"
+        f"  Showtime:   {checkout.get('show', {}).get('time_label', '?')}\n"
+        f"  Seats:      {checkout.get('seat', {}).get('label', '?')} × {checkout.get('qty', '?')}\n"
+        f"  Charged:    ${total_cents / 100:.2f} USD\n"
+        f"  Booking ID: {booking_id}\n"
         f"{note}"
-        f"\n  Enjoy your movie!\n"
+        f"\n  Enjoy your movie! 🍿\n"
         f"{_SEP}\n"
     )
     return Event(
-        output={"status": "booked", "session_id": node_input.get("session_id")},
+        output={"status": "booked", "session_id": session_id, "booking_id": booking_id},
         content=_content(msg),
     )
 
 
 def booking_invalid_terminal(node_input: dict[str, Any]) -> Any:
-    msg = (
-        f"\n{_SEP}\n"
-        f"  BOOKING FAILED — Invalid CartMandate\n"
-        f"{_SEP}\n"
-        f"  The theater's CartMandate failed validation.\n"
-        f"  Please try again or contact the theater.\n"
-        f"{_SEP}\n"
+    return Event(
+        output={"status": "invalid_mandate"},
+        content=_content(
+            f"\n{_SEP}\n  BOOKING FAILED — Invalid CartMandate\n{_SEP}\n"
+            f"  The theater's CartMandate failed validation. Please try again.\n{_SEP}\n"
+        ),
     )
-    return Event(output={"status": "invalid_mandate"}, content=_content(msg))
 
 
 def booking_cancelled_terminal(node_input: dict[str, Any]) -> Any:
-    msg = (
-        f"\n{_SEP}\n"
-        f"  BOOKING CANCELLED\n"
-        f"{_SEP}\n"
-        f"  No payment was made. Your session has been discarded.\n"
-        f"{_SEP}\n"
+    return Event(
+        output={"status": "cancelled"},
+        content=_content(
+            f"\n{_SEP}\n  BOOKING CANCELLED\n{_SEP}\n"
+            f"  No payment was made. Start a new chat to try again.\n{_SEP}\n"
+        ),
     )
-    return Event(output={"status": "cancelled"}, content=_content(msg))
 
 
 def sig_rejected_terminal(node_input: dict[str, Any]) -> Any:
-    msg = (
-        f"\n{_SEP}\n"
-        f"  BOOKING ABORTED — Mandate Verification Rejected\n"
-        f"{_SEP}\n"
-        f"  No payment was made.\n"
-        f"{_SEP}\n"
+    return Event(
+        output={"status": "sig_rejected"},
+        content=_content(
+            f"\n{_SEP}\n  BOOKING ABORTED — Mandate Verification Rejected\n{_SEP}\n"
+            f"  No payment was made.\n{_SEP}\n"
+        ),
     )
-    return Event(output={"status": "sig_rejected"}, content=_content(msg))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -643,35 +751,28 @@ def sig_rejected_terminal(node_input: dict[str, Any]) -> Any:
 root_agent = Workflow(
     name="cineagent",
     description=(
-        "Cinema ticket booking agent implementing UCP discovery and "
-        "AP2 mandate-based payments with two HITL authorization gates."
+        "Conversational cinema booking agent. Uses an LLM with tools for discovery, "
+        "then a deterministic AP2 mandate-based payment flow with HITL PIN gate."
     ),
     edges=[
-        # Automated discovery
-        ("START",           discover_theaters),
-        (discover_theaters, search_movies),
-        (search_movies,     select_showtime),
+        ("START", conversation_agent),
 
-        # HITL 1: user picks movie/show/seat
-        (select_showtime, {
+        (conversation_agent, {
             "selected":  create_checkout,
             "cancelled": booking_cancelled_terminal,
         }),
 
-        # Automated: build + validate CartMandate
         (create_checkout, verify_booking),
         (verify_booking, {
             "valid":   authorize_payment,
             "invalid": booking_invalid_terminal,
         }),
 
-        # HITL 2: user confirms payment
         (authorize_payment, {
             "confirmed": sign_ap2_mandates,
             "cancelled": booking_cancelled_terminal,
         }),
 
-        # Automated: sign + verify AP2 mandates
         (sign_ap2_mandates, verify_mandates),
         (verify_mandates, {
             "verified": booking_complete_terminal,
