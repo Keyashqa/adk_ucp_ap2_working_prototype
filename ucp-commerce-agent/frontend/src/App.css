@@ -1,67 +1,576 @@
+/* ══════════════════════════════════════════════════════════════
+   Design tokens — BookMyShow palette
+   ══════════════════════════════════════════════════════════════ */
+:root {
+  --bms-red:        #E61953;
+  --bms-red-dim:    #C0143F;
+  --bms-red-glow:   rgba(230, 25, 83, .35);
+  --bms-bg:         #0F0F1A;
+  --bms-surface:    #1C1C2E;
+  --bms-card:       #252539;
+  --bms-card-2:     #2D2D50;
+  --bms-border:     #353558;
+  --bms-border-dim: #2A2A46;
+  --bms-text:       #F0EEF8;
+  --bms-text-muted: #8080A8;
+  --bms-text-dim:   #5A5A7A;
+  --bms-gold:       #F5A623;
+  --bms-green:      #2ECC71;
+  --bms-font:       -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+body { background: var(--bms-bg); color: var(--bms-text); font-family: var(--bms-font); margin: 0; }
+
 /* ── Layout ─────────────────────────────────────────────── */
-.page { max-width: 480px; margin: 4rem auto; padding: 2rem; }
-.page-wide { max-width: 900px; margin: 0 auto; padding: 2rem; }
+.page      { max-width: 480px; margin: 4rem auto; padding: 2rem; }
+.page-wide { max-width: 900px; margin: 0 auto;    padding: 2rem; }
 
 /* ── Auth forms ─────────────────────────────────────────── */
-.auth-card { background: #1a202c; border: 1px solid #2d3748; border-radius: 16px; padding: 2rem; }
-.auth-card h1 { font-size: 1.4rem; margin-bottom: 1.5rem; text-align: center; }
+.auth-card {
+  background: var(--bms-surface);
+  border: 1px solid var(--bms-border);
+  border-radius: 18px;
+  padding: 2.25rem;
+  box-shadow: 0 8px 40px rgba(0,0,0,.5);
+}
+.auth-card h1 { font-size: 1.45rem; margin-bottom: 1.5rem; text-align: center; color: var(--bms-text); }
 .form-group { margin-bottom: 1rem; }
-.form-group label { display: block; font-size: .85rem; color: #a0aec0; margin-bottom: .35rem; }
-.form-group input { width: 100%; padding: .6rem .8rem; background: #2d3748; border: 1px solid #4a5568; border-radius: 8px; color: #e2e8f0; font-size: 1rem; }
-.form-group input:focus { outline: 2px solid #68d391; border-color: transparent; }
-.btn-primary { width: 100%; padding: .75rem; background: #48bb78; border: none; border-radius: 8px; color: #1a202c; font-size: 1rem; font-weight: 700; margin-top: .5rem; }
-.btn-primary:hover { background: #68d391; }
-.btn-secondary { background: #2d3748; border: 1px solid #4a5568; color: #e2e8f0; padding: .5rem 1rem; border-radius: 6px; font-size: .9rem; }
-.btn-secondary:hover { background: #4a5568; }
-.link-btn { background: none; border: none; color: #68d391; font-size: .9rem; margin-top: 1rem; display: block; text-align: center; }
-.error-msg { color: #fc8181; font-size: .85rem; margin-top: .5rem; }
+.form-group label { display: block; font-size: .82rem; color: var(--bms-text-muted); margin-bottom: .4rem; letter-spacing: .03em; text-transform: uppercase; }
+.form-group input { width: 100%; padding: .65rem .9rem; background: var(--bms-card); border: 1px solid var(--bms-border); border-radius: 10px; color: var(--bms-text); font-size: 1rem; }
+.form-group input:focus { outline: 2px solid var(--bms-red); border-color: transparent; }
+.btn-primary { width: 100%; padding: .8rem; background: linear-gradient(135deg, var(--bms-red), var(--bms-red-dim)); border: none; border-radius: 10px; color: #fff; font-size: 1rem; font-weight: 700; margin-top: .5rem; cursor: pointer; letter-spacing: .04em; box-shadow: 0 4px 18px var(--bms-red-glow); transition: all .18s; }
+.btn-primary:hover { box-shadow: 0 6px 24px rgba(230,25,83,.5); transform: translateY(-1px); }
+.btn-secondary { background: var(--bms-card); border: 1px solid var(--bms-border); color: var(--bms-text); padding: .5rem 1rem; border-radius: 8px; font-size: .88rem; cursor: pointer; transition: all .15s; }
+.btn-secondary:hover { border-color: var(--bms-red); color: var(--bms-red); }
+.link-btn { background: none; border: none; color: var(--bms-red); font-size: .9rem; margin-top: 1rem; display: block; text-align: center; cursor: pointer; }
+.error-msg { color: #FC8181; font-size: .85rem; margin-top: .5rem; }
 
 /* ── Wallet page ────────────────────────────────────────── */
-.wallet-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid #2d3748; }
+.wallet-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2rem; padding-bottom: 1rem; border-bottom: 1px solid var(--bms-border); }
 .nav-links { display: flex; gap: 1rem; align-items: center; }
-.balance-card { background: #1a202c; border: 1px solid #2d3748; border-radius: 16px; padding: 2rem; text-align: center; margin-bottom: 1.5rem; }
-.balance-amount { font-size: 3rem; font-weight: 700; color: #68d391; }
-.balance-label { color: #718096; font-size: .9rem; margin-top: .25rem; }
+.balance-card { background: linear-gradient(135deg, #1A1040 0%, var(--bms-surface) 100%); border: 1px solid var(--bms-border); border-radius: 18px; padding: 2rem; text-align: center; margin-bottom: 1.5rem; box-shadow: 0 4px 24px rgba(0,0,0,.4); }
+.balance-amount { font-size: 3rem; font-weight: 800; color: var(--bms-green); letter-spacing: -.02em; }
+.balance-label { color: var(--bms-text-muted); font-size: .88rem; margin-top: .3rem; }
 .topup-row { display: flex; gap: .75rem; margin-top: 1.5rem; flex-wrap: wrap; justify-content: center; }
-.topup-btn { background: #2d3748; border: 1px solid #4a5568; color: #e2e8f0; padding: .5rem 1.25rem; border-radius: 8px; font-size: .9rem; }
-.topup-btn:hover { background: #48bb78; color: #1a202c; border-color: #48bb78; }
-.txn-list { background: #1a202c; border: 1px solid #2d3748; border-radius: 12px; overflow: hidden; }
-.txn-item { display: flex; justify-content: space-between; padding: .85rem 1rem; border-bottom: 1px solid #2d3748; font-size: .9rem; }
+.topup-btn { background: var(--bms-card); border: 1px solid var(--bms-border); color: var(--bms-text); padding: .5rem 1.25rem; border-radius: 8px; font-size: .9rem; cursor: pointer; transition: all .15s; }
+.topup-btn:hover { background: var(--bms-red); color: #fff; border-color: var(--bms-red); }
+.txn-list { background: var(--bms-surface); border: 1px solid var(--bms-border); border-radius: 14px; overflow: hidden; }
+.txn-item { display: flex; justify-content: space-between; padding: .9rem 1.1rem; border-bottom: 1px solid var(--bms-border-dim); font-size: .9rem; }
 .txn-item:last-child { border-bottom: none; }
-.txn-credit { color: #68d391; font-weight: 600; }
-.txn-debit { color: #fc8181; font-weight: 600; }
-.txn-label { color: #a0aec0; font-size: .8rem; }
-section h3 { color: #a0aec0; margin-bottom: .75rem; font-size: .95rem; text-transform: uppercase; letter-spacing: .05em; }
+.txn-credit { color: var(--bms-green); font-weight: 700; }
+.txn-debit  { color: #FC8181; font-weight: 700; }
+.txn-label  { color: var(--bms-text-muted); font-size: .8rem; }
+section h3  { color: var(--bms-text-muted); margin-bottom: .75rem; font-size: .82rem; text-transform: uppercase; letter-spacing: .07em; }
 
-/* ── Chat page ──────────────────────────────────────────── */
-.chat-layout { display: flex; flex-direction: column; height: 100vh; }
-.chat-topbar { display: flex; justify-content: space-between; align-items: center; padding: .75rem 1.5rem; border-bottom: 1px solid #2d3748; background: #1a202c; }
-.chat-topbar h2 { font-size: 1rem; }
-.wallet-badge { background: #2d3748; border-radius: 20px; padding: .3rem .75rem; font-size: .85rem; color: #68d391; font-weight: 600; }
-.messages { flex: 1; overflow-y: auto; padding: 1.5rem; display: flex; flex-direction: column; gap: .75rem; }
-.msg { max-width: 80%; padding: .85rem 1rem; border-radius: 12px; font-size: .9rem; line-height: 1.5; white-space: pre-wrap; font-family: monospace; }
-.msg-agent { background: #1a202c; border: 1px solid #2d3748; align-self: flex-start; }
-.msg-user { background: #2d4a3e; border: 1px solid #276749; align-self: flex-end; }
-.msg-system { background: #2d2a1e; border: 1px solid #744210; align-self: center; color: #fbd38d; font-size: .8rem; }
-.chat-input-area { padding: 1rem 1.5rem; border-top: 1px solid #2d3748; background: #1a202c; }
-.chat-input-row { display: flex; gap: .75rem; }
-.chat-input-row input { flex: 1; padding: .65rem 1rem; background: #2d3748; border: 1px solid #4a5568; border-radius: 8px; color: #e2e8f0; font-size: .95rem; }
-.chat-input-row input:focus { outline: 2px solid #68d391; border-color: transparent; }
-.send-btn { background: #48bb78; border: none; border-radius: 8px; color: #1a202c; padding: .65rem 1.25rem; font-weight: 700; }
-.send-btn:disabled { background: #2d3748; color: #4a5568; cursor: not-allowed; }
+/* ── Chat layout ────────────────────────────────────────── */
+.chat-layout {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background: var(--bms-bg);
+}
+
+/* Topbar — BMS style with red bottom line */
+.chat-topbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: .75rem 1.5rem;
+  background: var(--bms-surface);
+  border-bottom: 2px solid var(--bms-red);
+  box-shadow: 0 2px 16px rgba(0,0,0,.4);
+}
+.chat-topbar h2 {
+  font-size: 1.15rem;
+  font-weight: 800;
+  color: var(--bms-text);
+  letter-spacing: -.01em;
+}
+
+.wallet-badge {
+  background: var(--bms-card);
+  border: 1px solid var(--bms-border);
+  border-radius: 20px;
+  padding: .3rem .85rem;
+  font-size: .85rem;
+  color: var(--bms-green);
+  font-weight: 700;
+  cursor: pointer;
+  transition: all .15s;
+}
+.wallet-badge:hover { border-color: var(--bms-green); }
+
+/* Messages area */
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.25rem 1.25rem 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: .6rem;
+}
+
+/* Plain text message bubbles */
+.msg {
+  max-width: 78%;
+  padding: .8rem 1rem;
+  border-radius: 12px;
+  font-size: .9rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  font-family: var(--bms-font);
+}
+.msg-agent {
+  background: var(--bms-surface);
+  border: 1px solid var(--bms-border);
+  align-self: flex-start;
+  color: var(--bms-text);
+}
+.msg-user {
+  background: linear-gradient(135deg, #2D1C3A, #3D1C2E);
+  border: 1px solid rgba(230,25,83,.3);
+  align-self: flex-end;
+  color: var(--bms-text);
+}
+.msg-system {
+  background: #2D2214;
+  border: 1px solid #744210;
+  align-self: center;
+  color: #FBD38D;
+  font-size: .8rem;
+  border-radius: 8px;
+  padding: .5rem 1rem;
+}
+
+/* Typing indicator */
+.typing { display: flex; gap: 5px; padding: .35rem .5rem; align-items: center; }
+.typing span { width: 7px; height: 7px; background: var(--bms-red); border-radius: 50%; animation: bounce .8s infinite; opacity: .6; }
+.typing span:nth-child(2) { animation-delay: .15s; }
+.typing span:nth-child(3) { animation-delay: .30s; }
+@keyframes bounce { 0%,80%,100% { transform: translateY(0); } 40% { transform: translateY(-5px); opacity: 1; } }
 
 /* ── PIN Modal ──────────────────────────────────────────── */
-.modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,.7); display: flex; align-items: center; justify-content: center; z-index: 100; }
-.modal-card { background: #1a202c; border: 1px solid #4a5568; border-radius: 16px; padding: 2rem; width: 320px; text-align: center; }
-.modal-card h2 { margin-bottom: .5rem; }
-.modal-card p { color: #a0aec0; font-size: .9rem; margin-bottom: 1.5rem; }
-.pin-input { font-size: 1.5rem; letter-spacing: .5rem; text-align: center; width: 100%; padding: .75rem; background: #2d3748; border: 1px solid #4a5568; border-radius: 8px; color: #e2e8f0; margin-bottom: 1rem; }
-.pin-input:focus { outline: 2px solid #68d391; border-color: transparent; }
-.modal-actions { display: flex; gap: .75rem; justify-content: center; }
-.btn-confirm { background: #48bb78; border: none; border-radius: 8px; color: #1a202c; padding: .65rem 1.5rem; font-weight: 700; font-size: 1rem; }
-.btn-cancel { background: #2d3748; border: 1px solid #4a5568; color: #e2e8f0; border-radius: 8px; padding: .65rem 1.25rem; }
-.typing { display: flex; gap: 4px; padding: .5rem 1rem; }
-.typing span { width: 8px; height: 8px; background: #4a5568; border-radius: 50%; animation: bounce .8s infinite; }
-.typing span:nth-child(2) { animation-delay: .15s; }
-.typing span:nth-child(3) { animation-delay: .3s; }
-@keyframes bounce { 0%,80%,100% { transform: translateY(0); } 40% { transform: translateY(-6px); } }
+.modal-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,.75);
+  backdrop-filter: blur(4px);
+  display: flex; align-items: center; justify-content: center;
+  z-index: 100;
+}
+.modal-card {
+  background: var(--bms-surface);
+  border: 1px solid var(--bms-border);
+  border-radius: 20px;
+  padding: 2.25rem;
+  width: 340px;
+  text-align: center;
+  box-shadow: 0 16px 60px rgba(0,0,0,.7);
+}
+.modal-card h2 { margin-bottom: .5rem; font-size: 1.3rem; }
+.modal-card p  { color: var(--bms-text-muted); font-size: .9rem; margin-bottom: 1.5rem; }
+.pin-input {
+  font-size: 1.6rem;
+  letter-spacing: .6rem;
+  text-align: center;
+  width: 100%;
+  padding: .75rem;
+  background: var(--bms-card);
+  border: 1px solid var(--bms-border);
+  border-radius: 10px;
+  color: var(--bms-text);
+  margin-bottom: 1rem;
+}
+.pin-input:focus { outline: 2px solid var(--bms-red); border-color: transparent; }
+.modal-actions  { display: flex; gap: .75rem; justify-content: center; }
+.btn-confirm {
+  background: linear-gradient(135deg, var(--bms-red), var(--bms-red-dim));
+  border: none; border-radius: 10px;
+  color: #fff; padding: .7rem 1.75rem;
+  font-weight: 700; font-size: 1rem; cursor: pointer;
+  box-shadow: 0 4px 16px var(--bms-red-glow);
+  transition: all .15s;
+}
+.btn-confirm:disabled { background: var(--bms-card); color: var(--bms-text-dim); box-shadow: none; cursor: not-allowed; }
+.btn-cancel {
+  background: var(--bms-card);
+  border: 1px solid var(--bms-border);
+  color: var(--bms-text);
+  border-radius: 10px;
+  padding: .7rem 1.25rem;
+  cursor: pointer;
+  transition: all .15s;
+}
+.btn-cancel:hover { border-color: var(--bms-red); color: var(--bms-red); }
+
+/* ══════════════════════════════════════════════════════════════
+   A2UI RICH COMPONENTS — BookMyShow Design System
+   ══════════════════════════════════════════════════════════════ */
+
+/* ── Container reset ────────────────────────────────────── */
+.msg-a2ui {
+  white-space: normal;
+  font-family: var(--bms-font);
+  max-width: 100%;
+  width: 100%;
+  padding: 0;
+  background: transparent;
+  border: none;
+  align-self: stretch;
+}
+
+.a2ui-surface { width: 100%; }
+
+/* ── Layout primitives ──────────────────────────────────── */
+.a2ui-column {
+  display: flex;
+  flex-direction: column;
+  gap: .55rem;
+}
+.a2ui-row {
+  display: flex;
+  flex-direction: row;
+  gap: .5rem;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+/* ── Card ───────────────────────────────────────────────── */
+.a2ui-card {
+  background: var(--bms-card);
+  border: 1px solid var(--bms-border);
+  border-radius: 14px;
+  padding: 1.1rem 1.25rem;
+  box-shadow: 0 4px 24px rgba(0,0,0,.45);
+}
+
+/* ── Text ───────────────────────────────────────────────── */
+.a2ui-text {
+  color: var(--bms-text);
+  font-size: .9rem;
+  line-height: 1.55;
+  margin: 0;
+  white-space: pre-line;
+}
+
+/* ── Divider ────────────────────────────────────────────── */
+.a2ui-divider {
+  border: none;
+  border-top: 1px solid var(--bms-border);
+  margin: .2rem 0;
+}
+
+/* ── Button base (red CTA) ──────────────────────────────── */
+.a2ui-button {
+  background: linear-gradient(135deg, var(--bms-red) 0%, var(--bms-red-dim) 100%);
+  border: none;
+  color: #fff;
+  border-radius: 10px;
+  padding: .7rem 1.25rem;
+  font-size: .9rem;
+  font-weight: 700;
+  cursor: pointer;
+  width: 100%;
+  text-align: center;
+  transition: all .18s ease;
+  box-shadow: 0 3px 14px var(--bms-red-glow);
+  letter-spacing: .03em;
+  font-family: var(--bms-font);
+}
+.a2ui-button:hover {
+  background: linear-gradient(135deg, #FF2060 0%, var(--bms-red) 100%);
+  box-shadow: 0 5px 20px rgba(230,25,83,.55);
+  transform: translateY(-1px);
+}
+.a2ui-button:active { transform: translateY(0); box-shadow: 0 2px 8px var(--bms-red-glow); }
+.a2ui-button:disabled { opacity: .45; cursor: not-allowed; transform: none; }
+.a2ui-button .a2ui-text { color: #fff; font-weight: 700; pointer-events: none; }
+
+/* ══════════════════════════════════════════════════════════════
+   COMPONENT-SPECIFIC OVERRIDES  (via data-id selectors)
+   ══════════════════════════════════════════════════════════════ */
+
+/* ── Welcome screen headings ────────────────────────────── */
+[data-id="welcome-heading"] {
+  font-size: 1.5rem;
+  font-weight: 800;
+  color: var(--bms-text);
+  letter-spacing: -.02em;
+  line-height: 1.2;
+}
+[data-id="welcome-sub"] {
+  font-size: .88rem;
+  color: var(--bms-text-muted);
+  margin-top: -.2rem;
+}
+
+/* ── Movie cards ────────────────────────────────────────── */
+[data-id^="movie-card-"] {
+  background: linear-gradient(145deg, #181830, var(--bms-card));
+  border: 1px solid var(--bms-border);
+  border-radius: 14px;
+  padding: 1.1rem 1.1rem 1rem 1.35rem;
+  position: relative;
+  overflow: hidden;
+  transition: border-color .2s, box-shadow .2s;
+}
+[data-id^="movie-card-"]:hover {
+  border-color: var(--bms-red);
+  box-shadow: 0 6px 28px rgba(230,25,83,.18);
+}
+/* Red left accent bar */
+[data-id^="movie-card-"]::before {
+  content: '';
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  width: 4px;
+  background: linear-gradient(to bottom, var(--bms-red), #FF6B9D);
+  border-radius: 14px 0 0 14px;
+}
+
+/* Movie title */
+[data-id^="movie-title-"] {
+  font-size: 1.1rem;
+  font-weight: 800;
+  color: var(--bms-text);
+  letter-spacing: -.01em;
+  line-height: 1.25;
+}
+
+/* Genre chip */
+[data-id^="movie-genre-"] {
+  font-size: .73rem;
+  font-weight: 700;
+  color: var(--bms-red);
+  background: rgba(230,25,83,.12);
+  border: 1px solid rgba(230,25,83,.25);
+  border-radius: 20px;
+  padding: .15rem .6rem;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+/* Rating chip */
+[data-id^="movie-rating-"] {
+  font-size: .73rem;
+  font-weight: 700;
+  color: var(--bms-gold);
+  background: rgba(245,166,35,.1);
+  border: 1px solid rgba(245,166,35,.25);
+  border-radius: 20px;
+  padding: .15rem .6rem;
+  letter-spacing: .04em;
+}
+
+/* Duration / language */
+[data-id^="movie-meta-"] {
+  font-size: .8rem;
+  color: var(--bms-text-muted);
+  margin-top: .1rem;
+}
+
+/* Book Now — outlined style on movie cards */
+[data-id^="movie-btn-"] {
+  background: transparent;
+  border: 1.5px solid var(--bms-red);
+  color: var(--bms-red);
+  border-radius: 8px;
+  padding: .5rem 1rem;
+  font-size: .8rem;
+  font-weight: 800;
+  letter-spacing: .08em;
+  box-shadow: none;
+  margin-top: .35rem;
+  transition: all .18s;
+}
+[data-id^="movie-btn-"]:hover {
+  background: var(--bms-red);
+  color: #fff;
+  box-shadow: 0 4px 16px var(--bms-red-glow);
+  transform: none;
+}
+[data-id^="movie-btn-"] .a2ui-text {
+  color: inherit;
+  font-weight: 800;
+  font-size: .8rem;
+  letter-spacing: .08em;
+}
+
+/* ── Showtime / seat / qty section headings ─────────────── */
+[data-id="heading"] {
+  font-size: 1.15rem;
+  font-weight: 800;
+  color: var(--bms-text);
+  letter-spacing: -.01em;
+}
+[data-id="subheading"] {
+  font-size: .82rem;
+  color: var(--bms-text-muted);
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  font-weight: 600;
+}
+[data-id="theater-name"],
+[data-id="showtime-val"] {
+  font-size: .88rem;
+  color: var(--bms-text-muted);
+}
+[data-id="theater-icon"],
+[data-id="show-icon"] {
+  font-size: .88rem;
+}
+
+/* ── Showtime chip buttons ──────────────────────────────── */
+[data-id^="slot-btn-"] {
+  background: transparent;
+  border: 1.5px solid var(--bms-border);
+  color: var(--bms-text);
+  border-radius: 10px;
+  padding: .55rem 1.1rem;
+  font-size: .9rem;
+  font-weight: 600;
+  width: auto;
+  box-shadow: none;
+  letter-spacing: .01em;
+  transition: all .15s;
+}
+[data-id^="slot-btn-"]:hover {
+  border-color: var(--bms-red);
+  background: rgba(230,25,83,.1);
+  color: var(--bms-red);
+  transform: none;
+  box-shadow: 0 2px 12px rgba(230,25,83,.2);
+}
+[data-id^="slot-btn-"] .a2ui-text {
+  color: inherit;
+  font-weight: 600;
+  font-size: .9rem;
+}
+
+/* ── Seat category buttons ──────────────────────────────── */
+[data-id^="seat-btn-"] {
+  background: var(--bms-surface);
+  border: 1.5px solid var(--bms-border);
+  color: var(--bms-text);
+  border-radius: 12px;
+  padding: .85rem 1rem;
+  font-size: .88rem;
+  font-weight: 600;
+  width: auto;
+  flex: 1;
+  min-width: 100px;
+  box-shadow: none;
+  transition: all .2s;
+}
+[data-id^="seat-btn-"]:hover {
+  border-color: var(--bms-red);
+  background: rgba(230,25,83,.08);
+  box-shadow: 0 4px 18px rgba(230,25,83,.25);
+  transform: translateY(-2px);
+}
+[data-id^="seat-btn-"] .a2ui-text {
+  color: inherit;
+  font-size: .88rem;
+  font-weight: 600;
+  white-space: pre-line;
+  text-align: center;
+}
+
+/* ── Quantity picker ────────────────────────────────────── */
+[data-id^="qty-wrapper-"] {
+  align-items: center;
+  gap: .3rem;
+}
+[data-id^="qty-btn-"] {
+  background: var(--bms-surface);
+  border: 1.5px solid var(--bms-border);
+  color: var(--bms-text);
+  border-radius: 50%;
+  padding: 0;
+  width: 52px;
+  height: 52px;
+  font-size: 1.1rem;
+  font-weight: 800;
+  box-shadow: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: all .18s;
+  flex-shrink: 0;
+}
+[data-id^="qty-btn-"]:hover {
+  border-color: var(--bms-red);
+  background: var(--bms-red);
+  box-shadow: 0 4px 16px var(--bms-red-glow);
+  transform: scale(1.1);
+}
+[data-id^="qty-btn-"] .a2ui-text {
+  color: inherit;
+  font-weight: 800;
+  font-size: 1.1rem;
+  text-align: center;
+}
+/* Price label below qty button */
+[data-id^="qty-price-"] {
+  font-size: .75rem;
+  color: var(--bms-text-muted);
+  text-align: center;
+}
+/* Chip tags in qty screen */
+[data-id="slot-chip"],
+[data-id="seat-chip"] {
+  font-size: .78rem;
+  font-weight: 600;
+  color: var(--bms-text-muted);
+  background: var(--bms-card);
+  border: 1px solid var(--bms-border);
+  border-radius: 20px;
+  padding: .2rem .7rem;
+}
+
+/* ── Checkout / summary cards ───────────────────────────── */
+[data-id="movie-row"],
+[data-id="theater-row"],
+[data-id="show-row"],
+[data-id="seat-row"] {
+  font-size: .9rem;
+  color: var(--bms-text);
+}
+
+/* Total / charge — prominent red */
+[data-id="total-row"],
+[data-id="charged-row"],
+[data-id="amount-row"] {
+  font-size: 1.15rem;
+  font-weight: 800;
+  color: var(--bms-red);
+  letter-spacing: -.01em;
+}
+
+/* ── Verification cards ─────────────────────────────────── */
+[data-id="sig-row"],
+[data-id="expiry-row"],
+[data-id="cart-row"],
+[data-id="payment-row"] {
+  color: var(--bms-green);
+  font-weight: 700;
+}
+[data-id="hint"] {
+  font-size: .85rem;
+  color: var(--bms-text-muted);
+  font-style: italic;
+}
+
+/* ── Mandate / booking confirmed ────────────────────────── */
+[data-id="bookingid-row"],
+[data-id="booking-row"] {
+  color: var(--bms-gold);
+  font-weight: 700;
+}
+[data-id="enjoy"] {
+  font-size: 1.05rem;
+  font-weight: 700;
+  color: var(--bms-gold);
+  text-align: center;
+  letter-spacing: .01em;
+}

@@ -77,17 +77,33 @@ export interface HitlRequest {
   question: string
 }
 
+export interface A2uiComponent {
+  id: string
+  component: 'Column' | 'Row' | 'Card' | 'Text' | 'Divider' | 'Button'
+  children?: string[]
+  child?: string
+  text?: string
+  action?: { event: { name: string } }
+}
+
+export interface A2uiSurface {
+  version: string
+  createSurface?: { surfaceId: string; catalogId: string }
+  updateComponents?: { surfaceId: string; components: A2uiComponent[] }
+}
+
 export interface Message {
   id: string
   role: 'user' | 'agent' | 'system'
   text: string
+  a2ui?: A2uiSurface[]
 }
 
 export async function* streamAdkRun(
   userId: string,
   sessionId: string,
   parts: object[],
-): AsyncGenerator<{ text?: string; hitl?: HitlRequest; done?: boolean }> {
+): AsyncGenerator<{ text?: string; hitl?: HitlRequest; a2ui?: A2uiSurface[]; done?: boolean }> {
   const body = JSON.stringify({
     app_name: 'app',
     user_id: userId,
@@ -124,7 +140,14 @@ export async function* streamAdkRun(
         const ev = JSON.parse(raw)
         const parts = ev?.content?.parts ?? []
         for (const p of parts) {
-          if (p.text) yield { text: p.text }
+          if (p.text) {
+            const m = (p.text as string).match(/<a2ui-json>([\s\S]*?)<\/a2ui-json>/)
+            if (m) {
+              try { yield { a2ui: JSON.parse(m[1]) as A2uiSurface[] } } catch { /* ignore malformed */ }
+            } else {
+              yield { text: p.text }
+            }
+          }
           if (p.functionCall?.name === 'adk_request_input') {
             yield {
               hitl: {

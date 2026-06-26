@@ -1,19 +1,22 @@
 # ruff: noqa
 """CineAgent — ADK 2.0 Workflow graph for cinema ticket booking.
 
-Graph topology:
+Graph topology (fully deterministic — no LLM):
   START
-    └─▶ conversation_agent  ← LLM agent (multi-turn, tool-calling)
-          ├─[cancelled]─▶ booking_cancelled_terminal
-          └─[selected]──▶ create_checkout    (automated: CartMandate via merchant HTTP)
-                            └─▶ verify_booking    (automated: validate CartMandate)
-                                  ├─[invalid]─▶ booking_invalid_terminal
-                                  └─[valid]──▶ authorize_payment  ← HITL: PIN via UI
-                                                ├─[cancelled]─▶ booking_cancelled_terminal
-                                                └─[confirmed]─▶ sign_ap2_mandates
-                                                                  └─▶ verify_mandates
-                                                                        ├─[verified]──▶ booking_complete_terminal
-                                                                        └─[rejected]──▶ sig_rejected_terminal
+    └─▶ show_movies         (A2UI movie cards + HITL: user clicks "Book Now")
+          └─▶ show_showtimes   (A2UI showtime buttons + HITL: user picks slot)
+                └─▶ show_seat_selection  (A2UI seat-type buttons + HITL)
+                      └─▶ show_qty_selection  (A2UI ticket-count buttons + HITL)
+                            ├─[confirmed]─▶ create_checkout   (merchant CartMandate)
+                            │                └─▶ verify_booking
+                            │                      ├─[invalid]─▶ booking_invalid_terminal
+                            │                      └─[valid]──▶ authorize_payment  ← HITL: PIN
+                            │                                    ├─[cancelled]─▶ booking_cancelled_terminal
+                            │                                    └─[confirmed]─▶ sign_ap2_mandates
+                            │                                                      └─▶ verify_mandates
+                            │                                                            ├─[verified]──▶ booking_complete_terminal
+                            │                                                            └─[rejected]──▶ sig_rejected_terminal
+                            └─[cancelled]─▶ booking_cancelled_terminal
 """
 from __future__ import annotations
 
@@ -35,7 +38,6 @@ from ap2.models.payment_request import (
     PaymentResponse,
 )
 from ap2.sdk.mandate import MandateClient, SdJwtMandate
-from google import genai
 from google.adk.agents.context import Context
 from google.adk.apps import App, ResumabilityConfig
 from google.adk.events.event import Event
@@ -45,7 +47,6 @@ from google.genai import types as genai_types
 from jwcrypto.jwk import JWK
 from jwcrypto.jwt import JWT
 
-from app.config import MODEL_NAME
 from app.keys import user_private_key_for, user_public_key_for
 from app.merchant_client import MerchantClient
 
@@ -54,15 +55,323 @@ from app.merchant_client import MerchantClient
 _SEP = "=" * 60
 _CLIENT = MerchantClient()
 
-# Lazily initialised so the API key is already set in env before first use
-_genai_client: genai.Client | None = None
+# ── A2UI transport ─────────────────────────────────────────────────────────────
+
+CATALOG_ID = "https://a2ui.org/specification/v0_9/catalogs/basic/catalog.json"
+
+SLOT_LABELS: dict[str, str] = {
+    "A": "10:00 AM",
+    "B": "2:30 PM",
+    "C": "7:00 PM",
+    "D": "10:15 PM",
+}
 
 
-def _get_genai_client() -> genai.Client:
-    global _genai_client
-    if _genai_client is None:
-        _genai_client = genai.Client()
-    return _genai_client
+def _a2ui_content(messages: list[dict]) -> genai_types.Content:
+    """Wrap A2UI messages as a tagged text Part for SSE transport.
+
+    json.dumps without indent keeps everything on one line so it fits in a
+    single SSE data: frame (the frontend buf.split('\\n') accumulator requires this).
+    """
+    payload = f"<a2ui-json>{json.dumps(messages)}</a2ui-json>"
+    return genai_types.Content(role="model", parts=[genai_types.Part(text=payload)])
+
+
+# ── A2UI builder functions ─────────────────────────────────────────────────────
+
+def _build_welcome_a2ui(movies: list[dict]) -> list[dict]:
+    surface_id = "cinema-welcome"
+    movie_ids = [m["id"] for m in movies]
+    components: list[dict] = [
+        {"id": "root", "component": "Column", "children": ["welcome-heading", "welcome-sub", "movies-col"]},
+        {"id": "welcome-heading", "component": "Text", "text": "Now Showing"},
+        {"id": "welcome-sub", "component": "Text", "text": "Select a movie to get started"},
+        {"id": "movies-col", "component": "Column", "children": [f"movie-card-{mid}" for mid in movie_ids]},
+    ]
+    for m in movies:
+        mid = m["id"]
+        genre    = m.get("genre", "")
+        duration = m.get("duration_min", "")
+        lang     = m.get("language", "English")
+        rating   = m.get("certificate", "UA")
+        components += [
+            {"id": f"movie-card-{mid}", "component": "Card", "child": f"movie-inner-{mid}"},
+            {"id": f"movie-inner-{mid}", "component": "Column",
+             "children": [f"movie-title-{mid}", f"movie-tags-{mid}", f"movie-meta-{mid}", f"movie-btn-{mid}"]},
+            {"id": f"movie-title-{mid}", "component": "Text", "text": m["title"]},
+            {"id": f"movie-tags-{mid}", "component": "Row",
+             "children": [f"movie-genre-{mid}", f"movie-rating-{mid}"]},
+            {"id": f"movie-genre-{mid}", "component": "Text", "text": genre},
+            {"id": f"movie-rating-{mid}", "component": "Text", "text": rating},
+            {"id": f"movie-meta-{mid}", "component": "Text",
+             "text": f"⏱ {duration} min  ·  {lang}"},
+            {"id": f"movie-btn-{mid}", "component": "Button",
+             "child": f"movie-btn-text-{mid}",
+             "action": {"event": {"name": f"movie_selected|{mid}|{m['title']}"}}},
+            {"id": f"movie-btn-text-{mid}", "component": "Text", "text": "BOOK NOW"},
+        ]
+    return [
+        {"version": "v0.9", "createSurface": {"surfaceId": surface_id, "catalogId": CATALOG_ID}},
+        {"version": "v0.9", "updateComponents": {"surfaceId": surface_id, "components": components}},
+    ]
+
+
+def _build_showtimes_a2ui(
+    movie_id: str, movie_title: str, shows: list[dict], theater_name: str
+) -> list[dict]:
+    surface_id = f"showtimes-{movie_id}"
+    slot_btn_ids = [f"slot-btn-{s['slot']}" for s in shows]
+    components: list[dict] = [
+        {"id": "root", "component": "Column",
+         "children": ["heading", "subheading", "theater-row", "divider-0", "slots-row"]},
+        {"id": "heading",     "component": "Text", "text": movie_title},
+        {"id": "subheading",  "component": "Text", "text": "Select Showtime"},
+        {"id": "theater-row", "component": "Row",
+         "children": ["theater-icon", "theater-name"]},
+        {"id": "theater-icon","component": "Text", "text": "📍"},
+        {"id": "theater-name","component": "Text", "text": theater_name},
+        {"id": "divider-0",   "component": "Divider"},
+        {"id": "slots-row",   "component": "Row", "children": slot_btn_ids},
+    ]
+    for s in shows:
+        slot = s["slot"]
+        time_label = s.get("time_label", SLOT_LABELS.get(slot, slot))
+        action = f"slot_selected|{movie_id}|{movie_title}|{slot}"
+        components += [
+            {"id": f"slot-btn-{slot}", "component": "Button",
+             "child": f"slot-txt-{slot}",
+             "action": {"event": {"name": action}}},
+            {"id": f"slot-txt-{slot}", "component": "Text", "text": time_label},
+        ]
+    return [
+        {"version": "v0.9", "createSurface": {"surfaceId": surface_id, "catalogId": CATALOG_ID}},
+        {"version": "v0.9", "updateComponents": {"surfaceId": surface_id, "components": components}},
+    ]
+
+
+_SEAT_EMOJI: dict[str, str] = {"S": "🪑", "P": "🛋️", "I": "🎞️"}
+
+
+def _build_seat_selection_a2ui(
+    movie_id: str, movie_title: str, slot: str, slot_label: str,
+    seats: dict, theater_name: str,
+) -> list[dict]:
+    surface_id = f"seats-{movie_id}-{slot}"
+    seat_btn_ids = [f"seat-btn-{code}" for code in seats]
+    components: list[dict] = [
+        {"id": "root", "component": "Column",
+         "children": ["heading", "showtime-row", "subheading", "divider-0", "seats-row"]},
+        {"id": "heading",      "component": "Text", "text": movie_title},
+        {"id": "showtime-row", "component": "Row",
+         "children": ["show-icon", "showtime-val"]},
+        {"id": "show-icon",   "component": "Text", "text": "🕐"},
+        {"id": "showtime-val","component": "Text", "text": slot_label},
+        {"id": "subheading",  "component": "Text", "text": "Choose Seat Category"},
+        {"id": "divider-0",   "component": "Divider"},
+        {"id": "seats-row",   "component": "Row", "children": seat_btn_ids},
+    ]
+    for code, info in seats.items():
+        label = info.get("label", code)
+        price = info.get("price_cents", 0) / 100
+        emoji = _SEAT_EMOJI.get(code.upper(), "💺")
+        action = f"seat_selected|{movie_id}|{movie_title}|{slot}|{code}"
+        components += [
+            {"id": f"seat-btn-{code}", "component": "Button",
+             "child": f"seat-txt-{code}",
+             "action": {"event": {"name": action}}},
+            {"id": f"seat-txt-{code}", "component": "Text",
+             "text": f"{emoji} {label}\n${price:.0f} / ticket"},
+        ]
+    return [
+        {"version": "v0.9", "createSurface": {"surfaceId": surface_id, "catalogId": CATALOG_ID}},
+        {"version": "v0.9", "updateComponents": {"surfaceId": surface_id, "components": components}},
+    ]
+
+
+def _build_qty_selection_a2ui(
+    movie_id: str, theater_id: str, movie_title: str,
+    slot: str, slot_label: str,
+    seat_code: str, seat_label: str, price_per_seat_cents: int,
+) -> list[dict]:
+    surface_id = f"qty-{movie_id}-{slot}-{seat_code}"
+    qty_wrapper_ids = [f"qty-wrapper-{q}" for q in range(1, 7)]
+    emoji = _SEAT_EMOJI.get(seat_code.upper(), "💺")
+    components: list[dict] = [
+        {"id": "root", "component": "Column",
+         "children": ["heading", "meta-row", "subheading", "divider-0", "qty-row"]},
+        {"id": "heading",  "component": "Text", "text": movie_title},
+        {"id": "meta-row", "component": "Row",
+         "children": ["slot-chip", "seat-chip"]},
+        {"id": "slot-chip","component": "Text", "text": f"🕐 {slot_label}"},
+        {"id": "seat-chip","component": "Text", "text": f"{emoji} {seat_label}"},
+        {"id": "subheading","component": "Text", "text": "How many tickets?"},
+        {"id": "divider-0", "component": "Divider"},
+        {"id": "qty-row",   "component": "Row", "children": qty_wrapper_ids},
+    ]
+    for q in range(1, 7):
+        total  = price_per_seat_cents * q / 100
+        action = f"booking_confirmed|{movie_id}|{theater_id}|{movie_title}|{slot}|{seat_code}|{q}"
+        components += [
+            {"id": f"qty-wrapper-{q}", "component": "Column",
+             "children": [f"qty-btn-{q}", f"qty-price-{q}"]},
+            {"id": f"qty-btn-{q}", "component": "Button",
+             "child": f"qty-num-{q}",
+             "action": {"event": {"name": action}}},
+            {"id": f"qty-num-{q}",   "component": "Text", "text": str(q)},
+            {"id": f"qty-price-{q}", "component": "Text", "text": f"${total:.0f}"},
+        ]
+    return [
+        {"version": "v0.9", "createSurface": {"surfaceId": surface_id, "catalogId": CATALOG_ID}},
+        {"version": "v0.9", "updateComponents": {"surfaceId": surface_id, "components": components}},
+    ]
+
+
+def _build_checkout_a2ui(checkout: dict, total_cents: int, session_id: str) -> list[dict]:
+    surface_id = f"checkout-{session_id[:8]}"
+    movie = checkout.get("movie", {})
+    show  = checkout.get("show", {})
+    seat  = checkout.get("seat", {})
+    qty   = checkout.get("qty", 1)
+    components = [
+        {"id": "root", "component": "Column", "children": ["heading", "divider-0", "card"]},
+        {"id": "heading", "component": "Text", "text": "🛒 Checkout Summary"},
+        {"id": "divider-0", "component": "Divider"},
+        {"id": "card", "component": "Card", "child": "card-inner"},
+        {"id": "card-inner", "component": "Column",
+         "children": ["movie-row", "theater-row", "show-row", "seat-row", "divider-1", "total-row"]},
+        {"id": "movie-row",   "component": "Text", "text": f"🎬  {movie.get('title', '?')}"},
+        {"id": "theater-row", "component": "Text", "text": f"📍  {checkout.get('theater_name', '?')}"},
+        {"id": "show-row",    "component": "Text", "text": f"🕐  {show.get('time_label', show.get('time', '?'))}"},
+        {"id": "seat-row",    "component": "Text", "text": f"💺  {seat.get('label', '?')} × {qty}"},
+        {"id": "divider-1",   "component": "Divider"},
+        {"id": "total-row",   "component": "Text", "text": f"💳  Total: ${total_cents / 100:.2f} USD"},
+    ]
+    return [
+        {"version": "v0.9", "createSurface": {"surfaceId": surface_id, "catalogId": CATALOG_ID}},
+        {"version": "v0.9", "updateComponents": {"surfaceId": surface_id, "components": components}},
+    ]
+
+
+def _build_verify_booking_a2ui(contents: Any, total_cents: int) -> list[dict]:
+    surface_id = f"verify-{str(contents.id)[:8]}"
+    components = [
+        {"id": "root", "component": "Column", "children": ["heading", "divider-0", "card"]},
+        {"id": "heading",  "component": "Text", "text": "✓ CartMandate Verified"},
+        {"id": "divider-0", "component": "Divider"},
+        {"id": "card",     "component": "Card", "child": "card-inner"},
+        {"id": "card-inner", "component": "Column",
+         "children": ["merchant-row", "cartid-row", "total-row", "sig-row", "expiry-row"]},
+        {"id": "merchant-row", "component": "Text", "text": f"Merchant: {contents.merchant_name}"},
+        {"id": "cartid-row",   "component": "Text", "text": f"Cart ID:  {contents.id}"},
+        {"id": "total-row",    "component": "Text", "text": f"Total:    ${total_cents / 100:.2f} USD"},
+        {"id": "sig-row",      "component": "Text", "text": "Signature: VALID"},
+        {"id": "expiry-row",   "component": "Text", "text": "Expiry:    VALID"},
+    ]
+    return [
+        {"version": "v0.9", "createSurface": {"surfaceId": surface_id, "catalogId": CATALOG_ID}},
+        {"version": "v0.9", "updateComponents": {"surfaceId": surface_id, "components": components}},
+    ]
+
+
+def _build_authorize_payment_a2ui(checkout: dict, total_cents: int, session_id: str) -> list[dict]:
+    surface_id = f"payment-{session_id[:8]}"
+    movie = checkout.get("movie", {})
+    show  = checkout.get("show", {})
+    seat  = checkout.get("seat", {})
+    qty   = checkout.get("qty", "?")
+    components = [
+        {"id": "root", "component": "Column",
+         "children": ["heading", "divider-0", "card", "divider-1", "hint"]},
+        {"id": "heading",  "component": "Text", "text": "💳 Payment Authorization Required"},
+        {"id": "divider-0", "component": "Divider"},
+        {"id": "card",     "component": "Card", "child": "card-inner"},
+        {"id": "card-inner", "component": "Column",
+         "children": ["movie-row", "show-row", "seat-row", "theater-row", "divider-2", "total-row"]},
+        {"id": "movie-row",   "component": "Text", "text": f"🎬  {movie.get('title', '?')}"},
+        {"id": "show-row",    "component": "Text", "text": f"🕐  {show.get('time_label', show.get('time', '?'))}"},
+        {"id": "seat-row",    "component": "Text", "text": f"💺  {seat.get('label', '?')} × {qty}"},
+        {"id": "theater-row", "component": "Text", "text": f"📍  {checkout.get('theater_name', '?')}"},
+        {"id": "divider-2",   "component": "Divider"},
+        {"id": "total-row",   "component": "Text", "text": f"💳  Total: ${total_cents / 100:.2f} USD"},
+        {"id": "divider-1",  "component": "Divider"},
+        {"id": "hint",       "component": "Text", "text": "Enter your PIN in the dialog below to confirm payment."},
+    ]
+    return [
+        {"version": "v0.9", "createSurface": {"surfaceId": surface_id, "catalogId": CATALOG_ID}},
+        {"version": "v0.9", "updateComponents": {"surfaceId": surface_id, "components": components}},
+    ]
+
+
+def _build_sign_mandates_a2ui(pmc: Any, sd_jwt_str: str, total_cents: int) -> list[dict]:
+    surface_id = f"mandate-{pmc.payment_mandate_id[-8:]}"
+    components = [
+        {"id": "root", "component": "Column", "children": ["heading", "divider-0", "card"]},
+        {"id": "heading",  "component": "Text", "text": "🖊️ AP2 PaymentMandate Signed"},
+        {"id": "divider-0", "component": "Divider"},
+        {"id": "card",     "component": "Card", "child": "card-inner"},
+        {"id": "card-inner", "component": "Column",
+         "children": ["mandateid-row", "session-row", "amount-row", "sdjwt-row"]},
+        {"id": "mandateid-row", "component": "Text", "text": f"Mandate ID: {pmc.payment_mandate_id}"},
+        {"id": "session-row",   "component": "Text", "text": f"Session:    {pmc.payment_details_id}"},
+        {"id": "amount-row",    "component": "Text", "text": f"Amount:     ${total_cents / 100:.2f} USD"},
+        {"id": "sdjwt-row",     "component": "Text", "text": f"SD-JWT:     {sd_jwt_str[:40]}…"},
+    ]
+    return [
+        {"version": "v0.9", "createSurface": {"surfaceId": surface_id, "catalogId": CATALOG_ID}},
+        {"version": "v0.9", "updateComponents": {"surfaceId": surface_id, "components": components}},
+    ]
+
+
+def _build_verify_mandates_a2ui(booking_id: str, session_id: str) -> list[dict]:
+    ref = booking_id or session_id
+    surface_id = f"verified-{ref[:8]}"
+    components = [
+        {"id": "root", "component": "Column", "children": ["heading", "divider-0", "card"]},
+        {"id": "heading",  "component": "Text", "text": "✓ Double-Mandate Verification Passed"},
+        {"id": "divider-0", "component": "Divider"},
+        {"id": "card",     "component": "Card", "child": "card-inner"},
+        {"id": "card-inner", "component": "Column",
+         "children": ["cart-row", "payment-row", "divider-1", "booking-row"]},
+        {"id": "cart-row",    "component": "Text", "text": "CartMandate (merchant JWT):  VALID"},
+        {"id": "payment-row", "component": "Text", "text": "PaymentMandate (AP2 SD-JWT): VALID"},
+        {"id": "divider-1",   "component": "Divider"},
+        {"id": "booking-row", "component": "Text", "text": f"Booking ID: {booking_id}"},
+    ]
+    return [
+        {"version": "v0.9", "createSurface": {"surfaceId": surface_id, "catalogId": CATALOG_ID}},
+        {"version": "v0.9", "updateComponents": {"surfaceId": surface_id, "components": components}},
+    ]
+
+
+def _build_booking_complete_a2ui(checkout: dict, total_cents: int, booking_id: str) -> list[dict]:
+    ref = booking_id or "x"
+    surface_id = f"confirmed-{ref[:8]}"
+    movie = checkout.get("movie", {})
+    show  = checkout.get("show", {})
+    seat  = checkout.get("seat", {})
+    qty   = checkout.get("qty", "?")
+    components = [
+        {"id": "root", "component": "Column",
+         "children": ["heading", "divider-0", "card", "divider-1", "enjoy"]},
+        {"id": "heading",  "component": "Text", "text": "🎉 Booking Confirmed!"},
+        {"id": "divider-0", "component": "Divider"},
+        {"id": "card",     "component": "Card", "child": "card-inner"},
+        {"id": "card-inner", "component": "Column",
+         "children": ["movie-row", "theater-row", "show-row", "seat-row", "divider-2", "charged-row", "bookingid-row"]},
+        {"id": "movie-row",    "component": "Text", "text": f"🎬  {movie.get('title', '?')}"},
+        {"id": "theater-row",  "component": "Text", "text": f"📍  {checkout.get('theater_name', '?')}"},
+        {"id": "show-row",     "component": "Text", "text": f"🕐  {show.get('time_label', '?')}"},
+        {"id": "seat-row",     "component": "Text", "text": f"💺  {seat.get('label', '?')} × {qty}"},
+        {"id": "divider-2",    "component": "Divider"},
+        {"id": "charged-row",  "component": "Text", "text": f"💳  Charged: ${total_cents / 100:.2f} USD"},
+        {"id": "bookingid-row", "component": "Text", "text": f"🎟️  Booking ID: {booking_id}"},
+        {"id": "divider-1",   "component": "Divider"},
+        {"id": "enjoy",       "component": "Text", "text": "Enjoy your movie! 🍿"},
+    ]
+    return [
+        {"version": "v0.9", "createSurface": {"surfaceId": surface_id, "catalogId": CATALOG_ID}},
+        {"version": "v0.9", "updateComponents": {"surfaceId": surface_id, "components": components}},
+    ]
 
 
 # ── Shared helpers ─────────────────────────────────────────────────────────────
@@ -88,442 +397,186 @@ def _verify_cart_jwt(jwt_str: str, merchant_public_jwk_dict: dict) -> bool:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Conversation-agent tools (FunctionDeclarations for Gemini)
-# ══════════════════════════════════════════════════════════════════════════════
-
-_CINEMA_TOOLS = genai_types.Tool(function_declarations=[
-    genai_types.FunctionDeclaration(
-        name="search_movies",
-        description=(
-            "Fetch the list of available movies and theaters from the cinema. "
-            "Call this first when the user asks what's playing or wants to browse."
-        ),
-        parameters=genai_types.Schema(
-            type=genai_types.Type.OBJECT,
-            properties={
-                "query": genai_types.Schema(
-                    type=genai_types.Type.STRING,
-                    description="Optional search term; leave empty to get all movies.",
-                ),
-            },
-        ),
-    ),
-    genai_types.FunctionDeclaration(
-        name="get_showtimes",
-        description=(
-            "Get available showtimes for a specific movie at a specific theater. "
-            "Use when the user has picked a movie and wants to know what times are available."
-        ),
-        parameters=genai_types.Schema(
-            type=genai_types.Type.OBJECT,
-            properties={
-                "theater_id": genai_types.Schema(
-                    type=genai_types.Type.STRING,
-                    description="Theater ID, e.g. pvr-001 or inox-001",
-                ),
-                "movie_id": genai_types.Schema(
-                    type=genai_types.Type.STRING,
-                    description="Movie ID returned by search_movies",
-                ),
-            },
-            required=["theater_id", "movie_id"],
-        ),
-    ),
-    genai_types.FunctionDeclaration(
-        name="confirm_booking",
-        description=(
-            "Call this ONLY once the user has explicitly agreed to all booking details: "
-            "theater, movie, showtime slot, seat type, and number of seats. "
-            "Do NOT call this unless the user has confirmed. "
-            "CRITICAL: movie_id MUST be the exact 'id' field from search_movies results "
-            "(e.g. 'mov-001', 'mov-002', 'mov-003'). Never invent or guess an ID."
-        ),
-        parameters=genai_types.Schema(
-            type=genai_types.Type.OBJECT,
-            properties={
-                "theater_id":  genai_types.Schema(type=genai_types.Type.STRING, description="e.g. pvr-001 or inox-001"),
-                "movie_id":    genai_types.Schema(type=genai_types.Type.STRING, description="Exact 'id' from search_movies — e.g. 'mov-001'. Never make up an ID."),
-                "movie_title": genai_types.Schema(type=genai_types.Type.STRING, description="Movie title for display"),
-                "slot":        genai_types.Schema(type=genai_types.Type.STRING, description="Slot letter: A=10:00 AM, B=2:30 PM, C=7:00 PM, D=10:15 PM"),
-                "seat_code":   genai_types.Schema(type=genai_types.Type.STRING, description="S=Standard, P=Premium Recliner, I=IMAX"),
-                "qty":         genai_types.Schema(type=genai_types.Type.INTEGER, description="Number of tickets (1–6)"),
-            },
-            required=["theater_id", "movie_id", "movie_title", "slot", "seat_code", "qty"],
-        ),
-    ),
-    genai_types.FunctionDeclaration(
-        name="cancel_booking",
-        description="Call this if the user explicitly wants to stop or cancel the booking process.",
-        parameters=genai_types.Schema(type=genai_types.Type.OBJECT, properties={}),
-    ),
-])
-
-_SYSTEM_PROMPT = """\
-You are a friendly cinema booking assistant for a multiplex ticketing app.
-Help the user discover movies and book tickets through natural conversation.
-
-Available theaters:
-  • pvr-001  — PVR Cinemas, Phoenix Mall
-  • inox-001 — INOX Multiplex, Orion Mall
-
-Showtime slots:  A = 10:00 AM  |  B = 2:30 PM  |  C = 7:00 PM  |  D = 10:15 PM
-Seat categories: S = Standard ($12)  |  P = Premium Recliner ($18)  |  I = IMAX ($22)
-
-Workflow:
-1. The catalog has already been fetched — it is in your conversation history as a search_movies result.
-   Use those exact movie IDs. Do NOT call search_movies again unless the user asks to refresh.
-2. Show the movies and ask what the user wants to watch.
-3. If the user asks about times, call get_showtimes for that movie + theater.
-4. Guide the user to pick: theater → movie → showtime → seat type → number of seats.
-5. Summarise the selection and ask the user to confirm.
-6. Once confirmed, call confirm_booking — use the EXACT movie_id from the search_movies result
-   already in your history (e.g. 'mov-001', 'mov-002'). Never invent or guess an ID.
-7. If the user wants to quit at any point, call cancel_booking.
-
-CRITICAL RULE: movie_id in confirm_booking must always be the exact 'id' field
-from the search_movies tool result (like 'mov-001'). Inventing an ID causes a hard error.
-
-Keep responses concise and conversational. Show prices when relevant.
-"""
-
-
-# ── History serialisation (state must be JSON-safe) ───────────────────────────
-
-def _pack_history(contents: list[genai_types.Content]) -> list[dict]:
-    """Convert Content objects → plain dicts for state storage."""
-    out = []
-    for c in contents:
-        parts = []
-        for p in c.parts:
-            if p.text:
-                parts.append({"text": p.text})
-            elif p.function_call:
-                parts.append({"function_call": {
-                    "name": p.function_call.name,
-                    "args": dict(p.function_call.args or {}),
-                }})
-            elif p.function_response:
-                parts.append({"function_response": {
-                    "name": p.function_response.name,
-                    "response": dict(p.function_response.response or {}),
-                }})
-        if parts:
-            out.append({"role": c.role, "parts": parts})
-    return out
-
-
-def _unpack_history(history: list[dict]) -> list[genai_types.Content]:
-    """Convert plain dicts → Content objects for the Gemini API."""
-    contents = []
-    for item in history:
-        parts = []
-        for p in item.get("parts", []):
-            if "text" in p:
-                parts.append(genai_types.Part(text=p["text"]))
-            elif "function_call" in p:
-                fc = p["function_call"]
-                parts.append(genai_types.Part(
-                    function_call=genai_types.FunctionCall(
-                        name=fc["name"], args=fc.get("args", {})
-                    )
-                ))
-            elif "function_response" in p:
-                fr = p["function_response"]
-                parts.append(genai_types.Part(
-                    function_response=genai_types.FunctionResponse(
-                        name=fr["name"], response=fr.get("response", {})
-                    )
-                ))
-        if parts:
-            contents.append(genai_types.Content(role=item["role"], parts=parts))
-    return contents
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# NODE 1 — conversation_agent   [LLM + HITL multi-turn]
-#
-# Runs Gemini with tool-calling in a loop:
-#   • text response  → show to user, issue RequestInput, pause
-#   • tool call      → execute, feed result back, loop
-#   • confirm_booking → route "selected" to create_checkout
-#   • cancel_booking  → route "cancelled"
+# NODE 1 — show_movies   [deterministic + HITL]
+# Fetches the movie catalog and shows A2UI cards. Waits for the user to click
+# a "Book Now" button, then routes "selected" with movie details.
 # ══════════════════════════════════════════════════════════════════════════════
 
 @node(rerun_on_resume=True)
-async def conversation_agent(ctx: Context, node_input: Any):
-    client = _get_genai_client()
-
-    # ── First invocation: fetch catalog + greet the user ─────────────────────
-    if "chat_history" not in ctx.state:
+async def show_movies(ctx: Context, node_input: Any):
+    if "movie_selected" not in ctx.resume_inputs:
         profile = await _CLIENT.fetch_ucp_profile()
         ctx.state["merchant_public_jwk"] = profile.get("merchant_public_jwk", {})
 
-        # Pre-fetch the full catalog and inject it as a real search_movies tool
-        # result in history.  This guarantees the LLM always has genuine movie IDs
-        # (mov-001, mov-002, …) in context before the user types anything, so it
-        # can never invent an ID when calling confirm_booking.
         movies_rsp = await _CLIENT.mcp_call(
             "search_movies", {"query": "", "limit": 20, "theater_id": "pvr-001"}
         )
-        movies_data = movies_rsp.get("result", {})
-        movies = movies_data.get("movies", [])
+        movies = movies_rsp.get("result", {}).get("movies", [])
+        ctx.state["movies"] = movies
 
-        # Build a human-readable list for the welcome message
-        movie_lines = "\n".join(
-            f"  {i+1}. {m['title']} (ID: {m['id']}) — {m['genre']}, {m['duration_min']} min"
-            for i, m in enumerate(movies)
-        )
-        welcome = (
-            "🎬 Welcome to CineAgent! Here's what's playing right now:\n\n"
-            f"{movie_lines}\n\n"
-            "Which movie would you like to watch? I can also show showtimes and prices."
-        )
-
-        # Bootstrap history: simulate the search_movies call that already happened.
-        # Gemini conversation rule: history must start with a user turn, and a
-        # model function_call must immediately follow a user turn or function_response.
-        # Pattern: user(seed) → model(function_call) → user(function_response) → model(text)
-        ctx.state["chat_history"] = _pack_history([
-            genai_types.Content(role="user", parts=[
-                genai_types.Part(text="Hello, I'd like to book a movie ticket.")
-            ]),
-            genai_types.Content(role="model", parts=[
-                genai_types.Part(function_call=genai_types.FunctionCall(
-                    name="search_movies", args={"query": "", "theater_id": "pvr-001"}
-                ))
-            ]),
-            genai_types.Content(role="user", parts=[
-                genai_types.Part(function_response=genai_types.FunctionResponse(
-                    name="search_movies", response=movies_data
-                ))
-            ]),
-            genai_types.Content(role="model", parts=[genai_types.Part(text=welcome)]),
-        ])
-
-        yield Event(content=_content(welcome))
-        yield RequestInput(interrupt_id="chat_turn", message=welcome)
+        yield Event(content=_a2ui_content(_build_welcome_a2ui(movies)))
+        yield RequestInput(interrupt_id="movie_selected", message="Select a movie to book")
         return
 
-    # ── Re-invoked after validate_selection rejected the LLM's selection ────────
-    # validate_selection routes "invalid" back here with _validation_error in
-    # node_input.  We inject the error into the LLM's history so it understands
-    # what went wrong, run it once to produce a corrective reply, then re-pause.
-    if isinstance(node_input, dict) and "_validation_error" in node_input:
-        err = node_input["_validation_error"]
-        history: list[dict] = list(ctx.state.get("chat_history", []))
-        history.append({
-            "role": "user",
-            "parts": [{"text": (
-                f"[System: booking validation failed — {err}. "
-                "The movie_id or other details you passed to confirm_booking were wrong. "
-                "Check the exact IDs from the search_movies result already in your history. "
-                "Apologise briefly to the user and ask them to clarify."
-            )}],
-        })
-        response = await client.aio.models.generate_content(
-            model=MODEL_NAME,
-            contents=_unpack_history(history),
-            config=genai_types.GenerateContentConfig(
-                system_instruction=_SYSTEM_PROMPT,
-                tools=[_CINEMA_TOOLS],
-            ),
+    # action format: "movie_selected|{movie_id}|{movie_title}"
+    action = str(ctx.resume_inputs.get("movie_selected", "")).strip()
+    parts  = action.split("|")
+    if len(parts) >= 3 and parts[0] in ("movie_selected", "select_movie"):
+        movie_id    = parts[1]
+        movie_title = "|".join(parts[2:])
+        ctx.state["movie_id"]    = movie_id
+        ctx.state["movie_title"] = movie_title
+        ctx.state["theater_id"]  = "pvr-001"
+        yield Event(
+            output={"movie_id": movie_id, "movie_title": movie_title, "theater_id": "pvr-001"},
+            route="selected",
         )
-        raw_parts = response.candidates[0].content.parts
-        text = "\n".join(p.text for p in raw_parts if getattr(p, "text", None)).strip()
-        if not text:
-            text = (
-                "Sorry, I had trouble with those booking details. "
-                "Could you confirm which movie you'd like? I'll look it up properly."
+    else:
+        yield Event(output={}, route="cancelled")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NODE 2 — show_showtimes   [deterministic + HITL]
+# Fetches live showtimes for the chosen movie and shows them as buttons.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@node(rerun_on_resume=True)
+async def show_showtimes(ctx: Context, node_input: Any):
+    if "slot_selected" not in ctx.resume_inputs:
+        movie_id    = node_input.get("movie_id", ctx.state.get("movie_id", ""))
+        movie_title = node_input.get("movie_title", ctx.state.get("movie_title", ""))
+        theater_id  = node_input.get("theater_id", "pvr-001")
+
+        rsp  = await _CLIENT.mcp_call("get_showtimes", {
+            "theater_id": theater_id, "movie_id": movie_id
+        })
+        data         = rsp.get("result", {})
+        shows        = data.get("shows", [])
+        seats        = data.get("seats", {})
+        theater      = data.get("theater", {})
+        theater_name = theater.get("name", theater_id)
+
+        ctx.state["seats"]        = seats
+        ctx.state["theater_name"] = theater_name
+
+        yield Event(content=_a2ui_content(
+            _build_showtimes_a2ui(movie_id, movie_title, shows, theater_name)
+        ))
+        yield RequestInput(interrupt_id="slot_selected", message="Select a showtime")
+        return
+
+    # action format: "slot_selected|{movie_id}|{movie_title}|{slot}"
+    action = str(ctx.resume_inputs.get("slot_selected", "")).strip()
+    parts  = action.split("|")
+    if len(parts) >= 4 and parts[0] == "slot_selected":
+        movie_id    = parts[1]
+        slot        = parts[-1].upper()
+        movie_title = "|".join(parts[2:-1])
+        ctx.state["slot"] = slot
+        yield Event(
+            output={**node_input, "movie_id": movie_id, "movie_title": movie_title, "slot": slot},
+            route="selected",
+        )
+    else:
+        yield Event(output=node_input, route="cancelled")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NODE 3 — show_seat_selection   [deterministic + HITL]
+# Shows seat type options (Standard / Premium / IMAX) with prices.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@node(rerun_on_resume=True)
+async def show_seat_selection(ctx: Context, node_input: Any):
+    if "seat_selected" not in ctx.resume_inputs:
+        movie_id    = node_input.get("movie_id", "")
+        movie_title = node_input.get("movie_title", "")
+        slot        = node_input.get("slot", "")
+        theater_name = ctx.state.get("theater_name", "Theater")
+        seats        = ctx.state.get("seats", {})
+        slot_label   = SLOT_LABELS.get(slot, slot)
+
+        yield Event(content=_a2ui_content(
+            _build_seat_selection_a2ui(movie_id, movie_title, slot, slot_label, seats, theater_name)
+        ))
+        yield RequestInput(interrupt_id="seat_selected", message="Select seat type")
+        return
+
+    # action format: "seat_selected|{movie_id}|{movie_title}|{slot}|{seat_code}"
+    action = str(ctx.resume_inputs.get("seat_selected", "")).strip()
+    parts  = action.split("|")
+    if len(parts) >= 5 and parts[0] == "seat_selected":
+        movie_id    = parts[1]
+        seat_code   = parts[-1].upper()
+        slot        = parts[-2].upper()
+        movie_title = "|".join(parts[2:-2])
+        ctx.state["seat_code"] = seat_code
+        yield Event(
+            output={**node_input, "movie_id": movie_id, "movie_title": movie_title,
+                    "slot": slot, "seat_code": seat_code},
+            route="selected",
+        )
+    else:
+        yield Event(output=node_input, route="cancelled")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NODE 4 — show_qty_selection   [deterministic + HITL]
+# Shows 1–6 ticket quantity buttons with per-option totals.
+# Routes "confirmed" to create_checkout with the full selection payload.
+# ══════════════════════════════════════════════════════════════════════════════
+
+@node(rerun_on_resume=True)
+async def show_qty_selection(ctx: Context, node_input: Any):
+    if "booking_confirmed" not in ctx.resume_inputs:
+        movie_id    = node_input.get("movie_id", "")
+        movie_title = node_input.get("movie_title", "")
+        slot        = node_input.get("slot", "")
+        seat_code   = node_input.get("seat_code", "S")
+        theater_id  = node_input.get("theater_id", "pvr-001")
+        seats       = ctx.state.get("seats", {})
+        slot_label  = SLOT_LABELS.get(slot, slot)
+        seat_info   = seats.get(seat_code, {})
+        seat_label  = seat_info.get("label", seat_code)
+        price_cents = seat_info.get("price_cents", 1200)
+
+        yield Event(content=_a2ui_content(
+            _build_qty_selection_a2ui(
+                movie_id, theater_id, movie_title,
+                slot, slot_label, seat_code, seat_label, price_cents,
             )
-        history.append({"role": "model", "parts": [{"text": text}]})
-        ctx.state["chat_history"] = history
-        yield Event(content=_content(text))
-        yield RequestInput(interrupt_id="chat_turn", message=text)
+        ))
+        yield RequestInput(interrupt_id="booking_confirmed", message="Select number of tickets")
         return
 
-    # ── Resumed: get the user's latest message ────────────────────────────────
-    user_msg = str(ctx.resume_inputs.get("chat_turn", "")).strip()
-    if not user_msg:
-        yield RequestInput(interrupt_id="chat_turn", message="What would you like to do?")
-        return
-
-    history: list[dict] = list(ctx.state.get("chat_history", []))
-    history.append({"role": "user", "parts": [{"text": user_msg}]})
-
-    # ── Inner loop: LLM → tool call → result → LLM … until text or terminal ──
-    while True:
-        response = await client.aio.models.generate_content(
-            model=MODEL_NAME,
-            contents=_unpack_history(history),
-            config=genai_types.GenerateContentConfig(
-                system_instruction=_SYSTEM_PROMPT,
-                tools=[_CINEMA_TOOLS],
-            ),
+    # action format: "booking_confirmed|{movie_id}|{theater_id}|{movie_title}|{slot}|{seat_code}|{qty}"
+    action = str(ctx.resume_inputs.get("booking_confirmed", "")).strip()
+    parts  = action.split("|")
+    if len(parts) >= 7 and parts[0] == "booking_confirmed":
+        movie_id    = parts[1]
+        theater_id  = parts[2]
+        qty         = int(parts[-1])
+        seat_code   = parts[-2].upper()
+        slot        = parts[-3].upper()
+        movie_title = "|".join(parts[3:-3])
+        yield Event(
+            output={
+                "movie_id":            movie_id,
+                "theater_id":          theater_id,
+                "movie_title":         movie_title,
+                "slot":                slot,
+                "seat":                seat_code,
+                "qty":                 qty,
+                "merchant_public_jwk": ctx.state.get("merchant_public_jwk", {}),
+            },
+            route="confirmed",
         )
-
-        raw_parts = response.candidates[0].content.parts
-        fc_parts  = [p for p in raw_parts if getattr(p, "function_call", None)
-                     and p.function_call.name]
-
-        # ── Branch: function call ──────────────────────────────────────────────
-        if fc_parts:
-            fc   = fc_parts[0].function_call
-            args = dict(fc.args or {})
-            history.append({"role": "model", "parts": [{"function_call": {"name": fc.name, "args": args}}]})
-
-            # Terminal: user confirmed booking
-            if fc.name == "confirm_booking":
-                selection = {
-                    "theater_id":          args.get("theater_id", "pvr-001"),
-                    "movie_id":            args.get("movie_id", ""),
-                    "movie_title":         args.get("movie_title", ""),
-                    "slot":                args.get("slot", "A").upper(),
-                    "seat":                args.get("seat_code", "S").upper(),
-                    "qty":                 max(1, min(6, int(args.get("qty", 1)))),
-                    "merchant_public_jwk": ctx.state.get("merchant_public_jwk", {}),
-                }
-                msg = (
-                    f"✓ Got it! Booking **{selection['movie_title']}**\n"
-                    f"  Slot {selection['slot']} · {selection['seat']} × {selection['qty']} seat(s)\n"
-                    f"  Proceeding to checkout…"
-                )
-                yield Event(output=selection, route="selected", content=_content(msg))
-                return
-
-            # Terminal: user cancelled
-            if fc.name == "cancel_booking":
-                yield Event(
-                    output={},
-                    route="cancelled",
-                    content=_content("👋 Booking cancelled. Come back whenever you'd like to watch something!"),
-                )
-                return
-
-            # Data tool: search_movies
-            if fc.name == "search_movies":
-                result = await _CLIENT.mcp_call("search_movies", {
-                    "query":     args.get("query", ""),
-                    "limit":     20,
-                    "theater_id": "pvr-001",
-                })
-                tool_data = result.get("result", {})
-
-            # Data tool: get_showtimes
-            elif fc.name == "get_showtimes":
-                result = await _CLIENT.mcp_call("get_showtimes", {
-                    "movie_id":  args.get("movie_id", ""),
-                    "theater_id": args.get("theater_id", "pvr-001"),
-                })
-                tool_data = result.get("result", {})
-
-            else:
-                tool_data = {"error": f"Unknown tool: {fc.name}"}
-
-            history.append({
-                "role": "user",
-                "parts": [{"function_response": {"name": fc.name, "response": tool_data}}],
-            })
-            # Loop back → LLM processes tool result
-
-        # ── Branch: text response → show to user, wait for next turn ──────────
-        else:
-            text = "\n".join(
-                p.text for p in raw_parts if getattr(p, "text", None)
-            ).strip() or "…"
-
-            history.append({"role": "model", "parts": [{"text": text}]})
-            ctx.state["chat_history"] = history
-
-            yield Event(content=_content(text))
-            yield RequestInput(interrupt_id="chat_turn", message=text)
-            return
+    else:
+        yield Event(output=node_input, route="cancelled")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 2 — validate_selection
-#
-# Hard gate between LLM output and the merchant API.
-#
-# Problem: the LLM can call confirm_booking with an invented movie_id (e.g.
-# "dune-messiah-id" instead of "mov-002"). This node catches that before any
-# real money or merchant state is touched.
-#
-# Calls get_showtimes(theater_id, movie_id) against the live merchant.
-# If the movie doesn't exist at that theater, the MCP returns empty shows.
-# Any field mismatch → route "invalid" back to conversation_agent with the
-# exact error so the LLM can correct itself.
-# All fields verified → route "valid" forward to create_checkout.
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def validate_selection(node_input: dict[str, Any]) -> Any:
-    theater_id = str(node_input.get("theater_id", "")).strip()
-    movie_id   = str(node_input.get("movie_id",   "")).strip()
-    slot       = str(node_input.get("slot",       "")).upper().strip()
-    seat_code  = str(node_input.get("seat",       "")).upper().strip()
-    qty        = int(node_input.get("qty", 0))
-
-    issues: list[str] = []
-
-    try:
-        rsp = await _CLIENT.mcp_call("get_showtimes", {
-            "theater_id": theater_id,
-            "movie_id":   movie_id,
-        })
-        data  = rsp.get("result", {})
-        shows = data.get("shows", [])     # list of {slot, time_label, …}
-        seats = data.get("seats", {})     # {code: {label, price_cents, …}}
-    except Exception as exc:
-        issues.append(f"merchant unreachable: {exc}")
-        shows = []
-        seats = {}
-
-    # 1. Movie must actually be showing at this theater
-    if not issues and not shows:
-        issues.append(
-            f"movie_id '{movie_id}' is not screening at theater '{theater_id}'. "
-            "Use the exact 'id' field (e.g. 'mov-001', 'mov-002') from the "
-            "search_movies result already in your history."
-        )
-
-    # 2. Slot must exist in the live schedule
-    valid_slots = {s["slot"] for s in shows}
-    if shows and slot not in valid_slots:
-        issues.append(
-            f"slot '{slot}' is not available. "
-            f"Valid slots: {', '.join(sorted(valid_slots))}"
-        )
-
-    # 3. Seat code must be a real category
-    if seats and seat_code not in seats:
-        issues.append(
-            f"seat_code '{seat_code}' is not valid. "
-            f"Valid codes: {', '.join(seats.keys())}"
-        )
-
-    # 4. Quantity must be sane
-    if not (1 <= qty <= 6):
-        issues.append(f"qty {qty} is out of range — must be 1 to 6")
-
-    if issues:
-        err = "; ".join(issues)
-        return Event(
-            output={**node_input, "_validation_error": err},
-            route="invalid",
-            content=_content(f"[validate_selection: INVALID — {err}]"),
-        )
-
-    return Event(
-        output=node_input,
-        route="valid",
-        content=_content(
-            f"[validate_selection: OK — {movie_id} @ {theater_id}, "
-            f"slot {slot}, {seat_code}×{qty}]"
-        ),
-    )
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# NODE 3 — create_checkout
+# NODE 5 — create_checkout
 # Automated: real HTTP MCP create_checkout → merchant-signed CartMandate returned
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -545,25 +598,7 @@ async def create_checkout(node_input: dict[str, Any]) -> Any:
     total_cents   = checkout["total_cents"]
     session_id    = checkout["session_id"]
     expires_at    = checkout["expires_at"]
-    seat_label    = checkout["seat"]["label"]
-    movie_title   = checkout["movie"]["title"]
-    show_time     = checkout["show"]["time_label"]
-    merchant_auth = checkout["cart_mandate"].get("merchant_authorization", "")
 
-    msg = (
-        f"\n{_SEP}\n"
-        f"  Checkout & CartMandate (AP2)\n"
-        f"{_SEP}\n"
-        f"  Session:      {session_id}\n"
-        f"  Theater:      {checkout['theater_name']}\n"
-        f"  Movie:        {movie_title}\n"
-        f"  Showtime:     {show_time}\n"
-        f"  Seats:        {seat_label} × {sel['qty']}\n"
-        f"  Total:        ${total_cents / 100:.2f} USD\n"
-        f"  Expires:      {expires_at}\n"
-        f"  Merchant sig: {merchant_auth[:52]}…\n"
-        f"{_SEP}\n"
-    )
     payload = {
         "cart_mandate":        checkout["cart_mandate"],
         "checkout":            checkout,
@@ -571,11 +606,15 @@ async def create_checkout(node_input: dict[str, Any]) -> Any:
         "session_id":          session_id,
         "merchant_public_jwk": sel.get("merchant_public_jwk", {}),
     }
-    return Event(output=payload, state={"cart_mandate": checkout["cart_mandate"]}, content=_content(msg))
+    return Event(
+        output=payload,
+        state={"cart_mandate": checkout["cart_mandate"]},
+        content=_a2ui_content(_build_checkout_a2ui(checkout, total_cents, session_id)),
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 3 — verify_booking
+# NODE 6 — verify_booking
 # Automated: expiry check + merchant JWT verification
 # Routes → "valid" | "invalid"
 # ══════════════════════════════════════════════════════════════════════════════
@@ -602,17 +641,11 @@ async def verify_booking(node_input: dict[str, Any]) -> Any:
         issues.append("missing merchant_authorization")
 
     if not issues:
-        msg = (
-            f"\n{_SEP}\n"
-            f"  CartMandate Verified ✓\n"
-            f"{_SEP}\n"
-            f"  Merchant: {contents.merchant_name}\n"
-            f"  Cart ID:  {contents.id}\n"
-            f"  Total:    ${node_input['total_cents'] / 100:.2f} USD\n"
-            f"  Sig: VALID  |  Expiry: VALID\n"
-            f"{_SEP}\n"
+        return Event(
+            output=node_input,
+            route="valid",
+            content=_a2ui_content(_build_verify_booking_a2ui(contents, node_input["total_cents"])),
         )
-        return Event(output=node_input, route="valid", content=_content(msg))
 
     msg = (
         f"\n{_SEP}\n"
@@ -625,7 +658,7 @@ async def verify_booking(node_input: dict[str, Any]) -> Any:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 4 — authorize_payment   [HUMAN-IN-THE-LOOP]
+# NODE 7 — authorize_payment   [HUMAN-IN-THE-LOOP]
 # Checks wallet balance first, then pauses for PIN (via React UI PinModal).
 # Routes → "confirmed" | "cancelled"
 # ══════════════════════════════════════════════════════════════════════════════
@@ -652,25 +685,10 @@ async def authorize_payment(ctx: Context, node_input: dict[str, Any]):
                 )
                 return
 
-        movie = checkout.get("movie", {})
-        show  = checkout.get("show", {})
-        seat  = checkout.get("seat", {})
-        qty   = checkout.get("qty", "?")
-        prompt = (
-            f"\n{_SEP}\n"
-            f"  PAYMENT AUTHORIZATION REQUIRED\n"
-            f"{_SEP}\n"
-            f"  Movie:      {movie.get('title', '?')}\n"
-            f"  Showtime:   {show.get('time_label', show.get('time', '?'))}\n"
-            f"  Seats:      {seat.get('label', '?')} × {qty}\n"
-            f"  Theater:    {checkout.get('theater_name', '?')}\n"
-            f"  ──────────────────────────────────────\n"
-            f"  TOTAL:      ${total_cents / 100:.2f} USD\n"
-            f"{_SEP}\n"
-            f"\n  Enter your PIN to confirm payment.\n"
-        )
-        yield _content(prompt)
-        yield RequestInput(interrupt_id="payment_auth", message=prompt)
+        yield Event(content=_a2ui_content(
+            _build_authorize_payment_a2ui(checkout, total_cents, node_input.get("session_id", ""))
+        ))
+        yield RequestInput(interrupt_id="payment_auth", message="Enter PIN to confirm payment")
         return
 
     response = str(ctx.resume_inputs.get("payment_auth", "")).lower().strip()
@@ -689,7 +707,7 @@ async def authorize_payment(ctx: Context, node_input: dict[str, Any]):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 5 — sign_ap2_mandates
+# NODE 8 — sign_ap2_mandates
 # Automated: PaymentMandateContents → SD-JWT using per-user key from agent DB
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -723,16 +741,6 @@ async def sign_ap2_mandates(node_input: dict[str, Any]) -> Any:
         user_authorization=sd_jwt_str,
     )
 
-    msg = (
-        f"\n{_SEP}\n"
-        f"  AP2 PaymentMandate Signed (SD-JWT)\n"
-        f"{_SEP}\n"
-        f"  Mandate ID: {pmc.payment_mandate_id}\n"
-        f"  Session:    {session_id}\n"
-        f"  Amount:     ${total_cents / 100:.2f} USD\n"
-        f"  SD-JWT:     {sd_jwt_str[:60]}…\n"
-        f"{_SEP}\n"
-    )
     return Event(
         output={
             **node_input,
@@ -741,12 +749,12 @@ async def sign_ap2_mandates(node_input: dict[str, Any]) -> Any:
             "user_id":         user_id,
         },
         state={"payment_mandate": payment_mandate.model_dump()},
-        content=_content(msg),
+        content=_a2ui_content(_build_sign_mandates_a2ui(pmc, sd_jwt_str, total_cents)),
     )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# NODE 6 — verify_mandates
+# NODE 9 — verify_mandates
 # Verifies CartMandate JWT + PaymentMandate SD-JWT locally, then POST to merchant.
 # Routes → "verified" | "rejected"
 # ══════════════════════════════════════════════════════════════════════════════
@@ -786,19 +794,12 @@ async def verify_mandates(ctx: Context, node_input: dict[str, Any]):
                     issues.append(f"Merchant rejected: {result.get('error', 'unknown')}")
                 else:
                     booking_id = result.get("booking_id", "")
-                    msg = (
-                        f"\n{_SEP}\n"
-                        f"  Double-Mandate Verification PASSED ✓\n"
-                        f"{_SEP}\n"
-                        f"  CartMandate   (merchant JWT):  VALID\n"
-                        f"  PaymentMandate (AP2 SD-JWT):   VALID\n"
-                        f"  Merchant confirmed booking ID: {booking_id}\n"
-                        f"{_SEP}\n"
-                    )
                     yield Event(
                         output={**node_input, "verified": True, "booking_id": booking_id, "user_id": user_id},
                         route="verified",
-                        content=_content(msg),
+                        content=_a2ui_content(
+                            _build_verify_mandates_a2ui(booking_id, node_input.get("session_id", ""))
+                        ),
                     )
                     return
             except Exception as exc:
@@ -845,33 +846,19 @@ async def booking_complete_terminal(node_input: dict[str, Any]) -> Any:
     total_cents = node_input.get("total_cents", 0)
     session_id  = node_input.get("session_id", "")
     booking_id  = node_input.get("booking_id", "")
-    note        = "  Note:     Human override applied\n" if node_input.get("override") else ""
 
     user_id = node_input.get("user_id")
+    note = ""
     if user_id and total_cents:
         try:
             from app import wallet as wallet_ops
             await wallet_ops.deduct(user_id, total_cents, reason="booking", reference_id=session_id)
         except Exception as exc:
-            note += f"  Wallet deduction failed: {exc}\n"
+            note = f"  Wallet deduction failed: {exc}\n"
 
-    msg = (
-        f"\n{_SEP}\n"
-        f"  🎉 BOOKING CONFIRMED!\n"
-        f"{_SEP}\n"
-        f"  Movie:      {checkout.get('movie', {}).get('title', '?')}\n"
-        f"  Theater:    {checkout.get('theater_name', '?')}\n"
-        f"  Showtime:   {checkout.get('show', {}).get('time_label', '?')}\n"
-        f"  Seats:      {checkout.get('seat', {}).get('label', '?')} × {checkout.get('qty', '?')}\n"
-        f"  Charged:    ${total_cents / 100:.2f} USD\n"
-        f"  Booking ID: {booking_id}\n"
-        f"{note}"
-        f"\n  Enjoy your movie! 🍿\n"
-        f"{_SEP}\n"
-    )
     return Event(
         output={"status": "booked", "session_id": session_id, "booking_id": booking_id},
-        content=_content(msg),
+        content=_a2ui_content(_build_booking_complete_a2ui(checkout, total_cents, booking_id)),
     )
 
 
@@ -912,20 +899,31 @@ def sig_rejected_terminal(node_input: dict[str, Any]) -> Any:
 root_agent = Workflow(
     name="cineagent",
     description=(
-        "Conversational cinema booking agent. Uses an LLM with tools for discovery, "
-        "then a deterministic AP2 mandate-based payment flow with HITL PIN gate."
+        "Fully deterministic cinema booking agent. "
+        "Button-driven A2UI flow: movie → showtime → seat type → quantity, "
+        "then AP2 double-mandate payment with HITL PIN gate."
     ),
     edges=[
-        ("START", conversation_agent),
+        ("START", show_movies),
 
-        (conversation_agent, {
-            "selected":  validate_selection,      # LLM output goes here first …
+        (show_movies, {
+            "selected":  show_showtimes,
             "cancelled": booking_cancelled_terminal,
         }),
 
-        (validate_selection, {
-            "valid":   create_checkout,           # … only reaches checkout if all fields verified
-            "invalid": conversation_agent,        # LLM must correct itself and try again
+        (show_showtimes, {
+            "selected":  show_seat_selection,
+            "cancelled": booking_cancelled_terminal,
+        }),
+
+        (show_seat_selection, {
+            "selected":  show_qty_selection,
+            "cancelled": booking_cancelled_terminal,
+        }),
+
+        (show_qty_selection, {
+            "confirmed": create_checkout,
+            "cancelled": booking_cancelled_terminal,
         }),
 
         (create_checkout, verify_booking),
